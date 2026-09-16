@@ -1,6 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX PayU Server — v3.1 (FINAL)
-// Render deploy ready
+// ArenaX PayU Server — v3.2 (FINAL FIXED)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -12,7 +11,6 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Content-Type");
@@ -52,17 +50,27 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ PayU Config ═══════════
+// ═══════════ Config ═══════════
 const PAYU_MERCHANT_KEY = process.env.PAYU_MERCHANT_KEY || "2Ax1YR";
 const PAYU_MERCHANT_SALT = process.env.PAYU_MERCHANT_SALT || "Em2qKk3sOPK3rZk1vbedwq8tlkBjy0Aq";
 const PAYU_ENVIRONMENT = process.env.PAYU_ENVIRONMENT || "test";
+
+// ✅ YAHAN APNA USER APP KA URL DAALO
+// Agar Firebase pe deploy kiya hai toh: https://tournament-b2771.web.app
+// Agar Render pe kiya hai toh: https://arenax-user-app.onrender.com
+// Agar Netlify pe kiya hai toh: https://arenax.netlify.app
+const USER_APP_URL = process.env.USER_APP_URL || "https://tournament-b2771.web.app";
 
 const PAYU_PAYMENT_URL = PAYU_ENVIRONMENT === "production"
   ? "https://secure.payu.in/_payment"
   : "https://test.payu.in/_payment";
 
+const SERVER_URL = process.env.SERVER_URL || "https://arenax-webhook.onrender.com";
+
 console.log(`💳 PayU Env: ${PAYU_ENVIRONMENT}`);
 console.log(`💳 PayU URL: ${PAYU_PAYMENT_URL}`);
+console.log(`🏠 User App URL: ${USER_APP_URL}`);
+console.log(`🖥️  Server URL: ${SERVER_URL}`);
 
 // ═══════════ PayU Hash ═══════════
 function generatePaymentHash(params) {
@@ -109,8 +117,10 @@ app.get("/", (req, res) => {
   res.json({
     service: "ArenaX PayU Server",
     status: "running",
-    version: "3.1.0",
+    version: "3.2.0",
     payuEnv: PAYU_ENVIRONMENT,
+    userAppUrl: USER_APP_URL,
+    serverUrl: SERVER_URL,
     endpoints: {
       health: "/health",
       createPayment: "/create-payment (POST)",
@@ -125,7 +135,8 @@ app.get("/health", (req, res) => {
     ts: Date.now(),
     service: "arenax-payu",
     firebase: admin.apps.length > 0 ? "connected" : "disconnected",
-    payuEnv: PAYU_ENVIRONMENT
+    payuEnv: PAYU_ENVIRONMENT,
+    userAppUrl: USER_APP_URL
   });
 });
 
@@ -158,8 +169,8 @@ app.post("/create-payment", async (req, res) => {
       firstname: (name || "Player").substring(0, 60),
       email: email || "user@arenax.app",
       phone: phone || "9999999999",
-      surl: "https://arenax-webhook.onrender.com/payment-success",
-      furl: "https://arenax-webhook.onrender.com/payment-success",
+      surl: SERVER_URL + "/payment-success",
+      furl: SERVER_URL + "/payment-success",
       udf1: uid,
       udf2: "",
       udf3: "",
@@ -188,6 +199,8 @@ app.all("/payment-success", async (req, res) => {
   const data = req.method === "POST" ? req.body : req.query;
   console.log("↩️ Payment redirect received");
   console.log("📦 Data:", JSON.stringify(data, null, 2));
+
+  let credited = false;
 
   try {
     const status = String(data.status || "").toLowerCase();
@@ -247,6 +260,7 @@ app.all("/payment-success", async (req, res) => {
             createdAt: admin.firestore.FieldValue.serverTimestamp()
           });
         });
+        credited = true;
         console.log(`✅ Credited ₹${amount} to ${uid}`);
       } else if (pendingSnap.exists) {
         console.log("✅ Already processed:", txnid);
@@ -260,7 +274,10 @@ app.all("/payment-success", async (req, res) => {
     console.error("❌ Credit error:", e);
   }
 
-  res.redirect("https://tournament-b2771.web.app/?deposit=success");
+  // ✅ Sahi redirect — user app pe bhejo (with success flag)
+  const redirectUrl = USER_APP_URL + (USER_APP_URL.includes("?") ? "&" : "?") + "deposit=success&txnid=" + encodeURIComponent(data.txnid || "");
+  console.log(`🔀 Redirecting to: ${redirectUrl}`);
+  res.redirect(redirectUrl);
 });
 
 // ═══════════ Test Endpoint ═══════════
@@ -280,4 +297,5 @@ app.post("/test-webhook", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX PayU running on port ${PORT}`);
+  console.log(`🔗 User app redirect: ${USER_APP_URL}`);
 });
