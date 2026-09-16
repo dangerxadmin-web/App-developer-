@@ -1,12 +1,16 @@
 {
   "name": "arenax-webhook",
   "version": "1.0.0",
+  "description": "ArenaX EkQR webhook for auto-deposit",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "firebase-admin": "^11.11.1"
+    "express": "^4.19.2",
+    "firebase-admin": "^12.0.0"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
