@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX PayU Server — v3.0
-// PayU redirect-based (no webhook needed)
+// ArenaX PayU Server — v3.1 (FINAL)
+// Render deploy ready
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -8,9 +8,11 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 
 const app = express();
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
+// CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Content-Type");
@@ -62,7 +64,7 @@ const PAYU_PAYMENT_URL = PAYU_ENVIRONMENT === "production"
 console.log(`💳 PayU Env: ${PAYU_ENVIRONMENT}`);
 console.log(`💳 PayU URL: ${PAYU_PAYMENT_URL}`);
 
-// ═══════════ PayU Hash Generation ═══════════
+// ═══════════ PayU Hash ═══════════
 function generatePaymentHash(params) {
   const hashString = [
     PAYU_MERCHANT_KEY,
@@ -107,7 +109,7 @@ app.get("/", (req, res) => {
   res.json({
     service: "ArenaX PayU Server",
     status: "running",
-    version: "3.0.0",
+    version: "3.1.0",
     payuEnv: PAYU_ENVIRONMENT,
     endpoints: {
       health: "/health",
@@ -181,7 +183,7 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// ═══════════ Payment Success/Failure Handler ═══════════
+// ═══════════ Payment Success Handler ═══════════
 app.all("/payment-success", async (req, res) => {
   const data = req.method === "POST" ? req.body : req.query;
   console.log("↩️ Payment redirect received");
@@ -191,11 +193,10 @@ app.all("/payment-success", async (req, res) => {
     const status = String(data.status || "").toLowerCase();
     const txnid = data.txnid || "";
 
-    // Verify hash (agar hash aaya hai)
     if (data.hash) {
       const calcHash = verifyResponseHash(data);
       if (calcHash !== data.hash) {
-        console.warn("⚠️ Hash mismatch. Received:", data.hash, "Calc:", calcHash);
+        console.warn("⚠️ Hash mismatch");
       } else {
         console.log("✅ Hash verified");
       }
@@ -259,168 +260,24 @@ app.all("/payment-success", async (req, res) => {
     console.error("❌ Credit error:", e);
   }
 
-  // User ko wapas app pe bhejo
   res.redirect("https://tournament-b2771.web.app/?deposit=success");
+});
+
+// ═══════════ Test Endpoint ═══════════
+app.post("/test-webhook", async (req, res) => {
+  try {
+    const txnid = req.body.txnid;
+    if (!txnid) return res.status(400).json({ ok: false, error: "txnid required" });
+    const pendingSnap = await db.collection("pending_deposits").doc(txnid).get();
+    if (!pendingSnap.exists) return res.json({ ok: true, note: "Not found" });
+    res.json({ ok: true, data: pendingSnap.data() });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // ═══════════ Start ═══════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX PayU running on port ${PORT}`);
-});    body.utr ||
-    body.bank_txn_id ||
-    body.transaction_id ||
-    body.upi_txn_id ||
-    body.rrn ||
-    body.ref_no ||
-    body.txn_id ||
-    "";
-
-  console.log("📋 Parsed:", { clientTxnId, status, amount, utr });
-
-  // 3. Only process successful payments
-  if (!["success", "completed", "paid", "successful"].includes(status)) {
-    console.log("⏭️ Non-success status, ignoring:", status);
-    return { ok: true, status: 200, ignored: true, actualStatus: status };
-  }
-
-  if (!clientTxnId) {
-    return { ok: false, status: 400, reason: "missing client_txn_id" };
-  }
-  if (amount <= 0) {
-    return { ok: false, status: 400, reason: "invalid amount" };
-  }
-
-  // 4. Find pending deposit by clientTxnId
-  const pendingQ = await db
-    .collection("pending_deposits")
-    .where("clientTxnId", "==", clientTxnId)
-    .limit(1)
-    .get();
-
-  if (pendingQ.empty) {
-    console.warn("⚠️ No pending deposit for:", clientTxnId);
-
-    // Try by orderId as backup
-    if (body.order_id) {
-      const altQ = await db
-        .collection("pending_deposits")
-        .where("orderId", "==", body.order_id)
-        .limit(1)
-        .get();
-      if (!altQ.empty) {
-        return await creditUser(altQ.docs[0], amount, utr, clientTxnId);
-      }
-    }
-    return { ok: true, status: 200, notFound: true };
-  }
-
-  return await creditUser(pendingQ.docs[0], amount, utr, clientTxnId);
-}
-
-// ═══════════ Credit Function ═══════════
-async function creditUser(pendingDoc, amount, utr, clientTxnId) {
-  const pendingData = pendingDoc.data();
-  const uid = pendingData.uid;
-
-  if (!uid) {
-    return { ok: false, status: 400, reason: "no uid in pending deposit" };
-  }
-
-  // Idempotency check
-  if (pendingData.status === "COMPLETED") {
-    console.log("✅ Already processed:", clientTxnId);
-    return { ok: true, status: 200, alreadyProcessed: true };
-  }
-
-  const userRef = db.collection("users").doc(uid);
-
-  await db.runTransaction(async (tx) => {
-    const userSnap = await tx.get(userRef);
-    if (!userSnap.exists) throw new Error("User not found: " + uid);
-
-    const userData = userSnap.data();
-    if (userData.banned === true) throw new Error("User is banned");
-
-    const currentBal = Number(userData.balance || 0);
-
-    // Credit balance
-    tx.update(userRef, { balance: currentBal + amount });
-
-    // Mark pending complete
-    tx.update(pendingDoc.ref, {
-      status: "COMPLETED",
-      utr: utr || "",
-      creditedAmount: amount,
-      completedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // Wallet transaction log
-    const txRef = db.collection("wallet_transactions").doc();
-    tx.set(txRef, {
-      uid: uid,
-      amount: amount,
-      type: "credit",
-      description: `Deposit via UPI — UTR ${utr || "auto"}`,
-      utr: utr || "",
-      clientTxnId: clientTxnId,
-      source: "webhook",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // Notification
-    const notifRef = db.collection("notifications").doc();
-    tx.set(notifRef, {
-      uid: uid,
-      title: "✅ Deposit Credited",
-      body: `₹${amount} added to your wallet!`,
-      read: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-  });
-
-  console.log(`✅ Credited ₹${amount} to ${uid}`);
-  return { ok: true, status: 200, credited: amount, uid };
-}
-
-// ═══════════ Main Webhook Endpoint ═══════════
-app.post("/ekqr-webhook", async (req, res) => {
-  const startTime = Date.now();
-  try {
-    const result = await handleEkqrWebhook(req.body);
-    const elapsed = Date.now() - startTime;
-    console.log(`⏱️ Processed in ${elapsed}ms`);
-    res.status(result.status || 200).json(result);
-  } catch (err) {
-    console.error("❌ Webhook error:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════ Test Endpoint ═══════════
-app.post("/test-webhook", async (req, res) => {
-  console.log("🧪 Test webhook called");
-  try {
-    const fakeBody = {
-      key: EKQR_API_KEY,
-      client_txn_id: req.body.client_txn_id || "TEST_" + Date.now(),
-      amount: req.body.amount || 10,
-      status: "success",
-      utr: "TESTUTR" + Date.now(),
-      ...req.body
-    };
-    const result = await handleEkqrWebhook(fakeBody);
-    res.json({ ok: true, result });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════ Start Server ═══════════
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 ArenaX Webhook running on port ${PORT}`);
-  console.log(`📍 Health:    /health`);
-  console.log(`📍 Webhook:   /ekqr-webhook (POST)`);
-  console.log(`📍 Test:      /test-webhook (POST)`);
 });
