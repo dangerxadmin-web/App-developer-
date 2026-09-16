@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX PayU Server — v3.2 (FINAL FIXED)
+// ArenaX PayU Server — v4.0 (No Redirect)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -55,12 +55,6 @@ const PAYU_MERCHANT_KEY = process.env.PAYU_MERCHANT_KEY || "2Ax1YR";
 const PAYU_MERCHANT_SALT = process.env.PAYU_MERCHANT_SALT || "Em2qKk3sOPK3rZk1vbedwq8tlkBjy0Aq";
 const PAYU_ENVIRONMENT = process.env.PAYU_ENVIRONMENT || "test";
 
-// ✅ YAHAN APNA USER APP KA URL DAALO
-// Agar Firebase pe deploy kiya hai toh: https://tournament-b2771.web.app
-// Agar Render pe kiya hai toh: https://arenax-user-app.onrender.com
-// Agar Netlify pe kiya hai toh: https://arenax.netlify.app
-const USER_APP_URL = process.env.USER_APP_URL || "https://tournament-b2771.web.app";
-
 const PAYU_PAYMENT_URL = PAYU_ENVIRONMENT === "production"
   ? "https://secure.payu.in/_payment"
   : "https://test.payu.in/_payment";
@@ -69,8 +63,7 @@ const SERVER_URL = process.env.SERVER_URL || "https://arenax-webhook.onrender.co
 
 console.log(`💳 PayU Env: ${PAYU_ENVIRONMENT}`);
 console.log(`💳 PayU URL: ${PAYU_PAYMENT_URL}`);
-console.log(`🏠 User App URL: ${USER_APP_URL}`);
-console.log(`🖥️  Server URL: ${SERVER_URL}`);
+console.log(`🖥️ Server URL: ${SERVER_URL}`);
 
 // ═══════════ PayU Hash ═══════════
 function generatePaymentHash(params) {
@@ -117,15 +110,9 @@ app.get("/", (req, res) => {
   res.json({
     service: "ArenaX PayU Server",
     status: "running",
-    version: "3.2.0",
+    version: "4.0.0",
     payuEnv: PAYU_ENVIRONMENT,
-    userAppUrl: USER_APP_URL,
-    serverUrl: SERVER_URL,
-    endpoints: {
-      health: "/health",
-      createPayment: "/create-payment (POST)",
-      paymentSuccess: "/payment-success (POST/GET)"
-    }
+    serverUrl: SERVER_URL
   });
 });
 
@@ -135,8 +122,7 @@ app.get("/health", (req, res) => {
     ts: Date.now(),
     service: "arenax-payu",
     firebase: admin.apps.length > 0 ? "connected" : "disconnected",
-    payuEnv: PAYU_ENVIRONMENT,
-    userAppUrl: USER_APP_URL
+    payuEnv: PAYU_ENVIRONMENT
   });
 });
 
@@ -194,13 +180,15 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// ═══════════ Payment Success Handler ═══════════
+// ═══════════ Payment Success — NO REDIRECT ═══════════
 app.all("/payment-success", async (req, res) => {
   const data = req.method === "POST" ? req.body : req.query;
   console.log("↩️ Payment redirect received");
   console.log("📦 Data:", JSON.stringify(data, null, 2));
 
   let credited = false;
+  let creditAmount = 0;
+  let creditError = "";
 
   try {
     const status = String(data.status || "").toLowerCase();
@@ -235,7 +223,7 @@ app.all("/payment-success", async (req, res) => {
           tx.update(pendingRef, {
             status: "COMPLETED",
             mihpayid: data.mihpayid || "",
-            source: "payu-redirect",
+            source: "payu-direct",
             completedAt: admin.firestore.FieldValue.serverTimestamp()
           });
 
@@ -261,26 +249,80 @@ app.all("/payment-success", async (req, res) => {
           });
         });
         credited = true;
+        creditAmount = amount;
         console.log(`✅ Credited ₹${amount} to ${uid}`);
       } else if (pendingSnap.exists) {
+        credited = true;
+        creditAmount = Number(pendingSnap.data().amount || 0);
         console.log("✅ Already processed:", txnid);
       } else {
         console.warn("⚠️ No pending deposit for:", txnid);
+        creditError = "Pending deposit not found";
       }
     } else {
-      console.log("⏭️ Non-success or missing txnid:", status, txnid);
+      console.log("⏭️ Non-success status:", status);
+      creditError = "Payment status: " + status;
     }
   } catch (e) {
     console.error("❌ Credit error:", e);
+    creditError = e.message;
   }
 
-  // ✅ Sahi redirect — user app pe bhejo (with success flag)
-  const redirectUrl = USER_APP_URL + (USER_APP_URL.includes("?") ? "&" : "?") + "deposit=success&txnid=" + encodeURIComponent(data.txnid || "");
-  console.log(`🔀 Redirecting to: ${redirectUrl}`);
-  res.redirect(redirectUrl);
+  // ✅ NO REDIRECT — ek clean success screen dikhao
+  const statusIcon = credited ? "✅" : "⚠️";
+  const statusColor = credited ? "#00e676" : "#ffb300";
+  const statusTitle = credited ? "Payment Successful!" : "Payment Received";
+  const statusMsg = credited
+    ? `₹${creditAmount} aapke wallet me add ho gaya hai.`
+    : "Payment aa gaya, verification 1-2 min me hoga.";
+  const hint = "Aap is page ko band kar sakte ho. Wapas app kholke balance dekho.";
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Payment Successful — ArenaX</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:-apple-system,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;}
+.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px;box-shadow:0 10px 40px rgba(0,0,0,.6);}
+.icon{font-size:72px;margin-bottom:18px;}
+.title{font-size:22px;font-weight:800;margin-bottom:12px;color:${statusColor};}
+.msg{font-size:15px;color:#8892b0;line-height:1.6;margin-bottom:24px;}
+.amount{font-size:32px;font-weight:900;color:#ffb300;margin:18px 0;letter-spacing:1px;}
+.hint{padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff;line-height:1.5;}
+.close-btn{display:block;width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer;letter-spacing:1px;}
+.close-btn:active{transform:scale(.98);}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">${statusIcon}</div>
+  <div class="title">${statusTitle}</div>
+  ${credited ? `<div class="amount">₹${creditAmount}</div>` : ""}
+  <div class="msg">${statusMsg}</div>
+  <div class="hint">${hint}</div>
+  <button class="close-btn" onclick="tryClose()">CLOSE PAGE</button>
+</div>
+<script>
+function tryClose(){
+  // Try to close tab (may fail if not opened by script)
+  window.open('', '_self', '');
+  window.close();
+  // Fallback — go back
+  setTimeout(() => {
+    if (document.referrer) history.back();
+  }, 100);
+}
+// Auto attempt close after 3 sec
+setTimeout(() => { tryClose(); }, 3000);
+</script>
+</body>
+</html>`);
 });
 
-// ═══════════ Test Endpoint ═══════════
+// ═══════════ Test ═══════════
 app.post("/test-webhook", async (req, res) => {
   try {
     const txnid = req.body.txnid;
@@ -297,5 +339,4 @@ app.post("/test-webhook", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX PayU running on port ${PORT}`);
-  console.log(`🔗 User app redirect: ${USER_APP_URL}`);
 });
