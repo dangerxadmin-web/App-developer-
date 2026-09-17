@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX AMR Pay Server — v3.0 (Nested Response Fixed)
+// ArenaX Server — v7.0 (Referral + Bonus + Auto-Deposit)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -23,7 +23,7 @@ try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
     const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf-8");
     serviceAccount = JSON.parse(decoded);
-    console.log("✅ Firebase SA loaded");
+    console.log("✅ Firebase SA loaded from BASE64");
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   } else if (process.env.NODE_ENV !== "production") {
@@ -44,22 +44,146 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ AMR Pay Config ═══════════
+// ═══════════ Config ═══════════
 const AMRPAY_API_KEY = (process.env.AMRPAY_API_KEY || "").trim();
 const AMRPAY_CREATE_URL = "https://amrpay.com/api/create-transaction.php";
+const AMRPAY_STATUS_URL = "https://amrpay.com/api/status.php";
+
+// Referral & Bonus Config
+const REFERRAL_SIGNUP_BONUS = 5;
+const REFERRAL_FIRST_DEPOSIT_BONUS = 20;
+const REFERRER_BONUS = 5;
+const MIN_DEPOSIT_FOR_BONUS = 100;
 
 console.log(`💳 AMR Pay API Key: ${AMRPAY_API_KEY.substring(0, 20)}...`);
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX AMR Pay Server", status: "running", version: "3.0.0" });
+  res.json({ service: "ArenaX Server", status: "running", version: "7.0.0" });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now(), service: "arenax-amrpay", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
+  res.json({ ok: true, ts: Date.now(), service: "arenax", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
 });
 
-// ═══════════ Create Payment ═══════════
+// ═══════════ Referral Code Generate ═══════════
+function generateReferralCode(name) {
+  const clean = (name || "PLAYER").toUpperCase().replace(/[^A-Z0-9]/g, "").substring(0, 8) || "PLAYER";
+  const num = Math.floor(100 + Math.random() * 900);
+  return clean + num;
+}
+
+// ═══════════ Verify Referral Code ═══════════
+app.post("/verify-referral", async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ ok: false, error: "Code required" });
+
+    const refCode = String(code).trim().toUpperCase();
+    const q = await db.collection("users").where("referralCode", "==", refCode).limit(1).get();
+
+    if (q.empty) return res.json({ ok: false, valid: false, error: "Invalid referral code" });
+
+    const referrerDoc = q.docs[0];
+    const referrerData = referrerDoc.data();
+
+    res.json({
+      ok: true,
+      valid: true,
+      referrerUid: referrerDoc.id,
+      referrerName: referrerData.name || "Player"
+    });
+  } catch (err) {
+    console.error("❌ Verify referral error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════ Create User (Signup with Referral) ═══════════
+app.post("/create-user", async (req, res) => {
+  try {
+    const { uid, name, email, phone, referralCode } = req.body;
+
+    if (!uid || !name || !email) {
+      return res.status(400).json({ ok: false, error: "uid, name, email required" });
+    }
+
+    // Referrer dhundo (agar code diya hai)
+    let referrerUid = null;
+    if (referralCode) {
+      const refCode = String(referralCode).trim().toUpperCase();
+      const q = await db.collection("users").where("referralCode", "==", refCode).limit(1).get();
+      if (!q.empty) {
+        referrerUid = q.docs[0].id;
+        console.log(`🎁 Referral detected: ${refCode} → ${referrerUid}`);
+      }
+    }
+
+    const myRefCode = generateReferralCode(name);
+    const signupBonus = referrerUid ? REFERRAL_SIGNUP_BONUS : 0;
+
+    // User doc check karo — agar already exists toh skip
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+    if (userSnap.exists) {
+      return res.json({ ok: true, alreadyExists: true });
+    }
+
+    // User banao
+    await userRef.set({
+      uid,
+      name,
+      email,
+      phone: phone || "",
+      photoURL: "",
+      balance: 0,
+      bonusBalance: signupBonus,
+      gameUid: "",
+      ign: "",
+      matchesPlayed: 0,
+      banned: false,
+      referralCode: myRefCode,
+      referredBy: referrerUid || "",
+      referralRewarded: false,
+      firstDepositRewarded: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Signup bonus log
+    if (signupBonus > 0) {
+      await db.collection("wallet_transactions").add({
+        uid,
+        amount: signupBonus,
+        type: "credit",
+        isBonus: true,
+        description: "🎁 Sign-up Referral Bonus",
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      await db.collection("notifications").add({
+        uid,
+        title: "🎁 Welcome Bonus!",
+        body: `₹${signupBonus} sign-up bonus mila! Tournament join karne me use kar sakte ho.`,
+        read: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+    }
+
+    console.log(`✅ User created: ${uid} (refCode: ${myRefCode}, referredBy: ${referrerUid || "none"})`);
+
+    res.json({
+      ok: true,
+      referralCode: myRefCode,
+      signupBonus,
+      referredBy: referrerUid || ""
+    });
+
+  } catch (err) {
+    console.error("❌ Create user error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════ Create Payment (AMR Pay) ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
@@ -67,17 +191,15 @@ app.post("/create-payment", async (req, res) => {
     if (!uid || !amount || Number(amount) < 10) {
       return res.status(400).json({ ok: false, error: "Invalid uid or amount (min ₹10)" });
     }
-
     if (!AMRPAY_API_KEY) {
-      console.error("❌ AMRPAY_API_KEY not set");
       return res.status(500).json({ ok: false, error: "AMR Pay API key missing on server" });
     }
 
     const orderId = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
 
     await db.collection("pending_deposits").doc(orderId).set({
-      uid: uid,
-      orderId: orderId,
+      uid,
+      orderId,
       amount: Number(amount),
       status: "PENDING",
       gateway: "amrpay",
@@ -94,7 +216,7 @@ app.post("/create-payment", async (req, res) => {
       remark: "ArenaX Wallet Topup"
     };
 
-    console.log("📤 AMR Pay create request:", JSON.stringify(payload));
+    console.log("📤 AMR Pay create:", JSON.stringify(payload));
 
     const amrResp = await fetch(AMRPAY_CREATE_URL, {
       method: "POST",
@@ -103,51 +225,37 @@ app.post("/create-payment", async (req, res) => {
     });
 
     const rawText = await amrResp.text();
-    console.log("📥 AMR Pay RAW response:", rawText.substring(0, 800));
+    console.log("📥 AMR Pay RAW:", rawText.substring(0, 500));
 
     let result;
-    try {
-      result = JSON.parse(rawText);
-    } catch (e) {
-      console.error("❌ AMR Pay ne JSON nahi bheja");
-      return res.status(500).json({ ok: false, error: "AMR Pay response invalid" });
-    }
+    try { result = JSON.parse(rawText); }
+    catch (e) { return res.status(500).json({ ok: false, error: "AMR Pay response invalid" }); }
 
-    // ✅ FIX: Nested data object se fields nikalo
     const d = result.data || result;
-
     const txnId = d.txn_id || d.txnId || d.transaction_id || d.id || "";
     const paymentUrl = d.payment_url || d.paymentUrl || d.url || "";
-    const qrUrl = d.qr_url || d.qrUrl || "";
-    const upiUrl = d.upi_url || d.upiUrl || d.upi_intent || "";
 
     if (!txnId && !paymentUrl) {
-      console.error("❌ No txn_id or payment_url in response:", JSON.stringify(result));
       return res.status(500).json({ ok: false, error: "AMR Pay ne txn_id nahi bheja" });
     }
 
-    // ✅ Payment URL fallback
     let finalPaymentUrl = paymentUrl;
     if (!finalPaymentUrl && txnId) {
       finalPaymentUrl = "https://amrpay.com/pay.php?txn_id=" + encodeURIComponent(txnId);
     }
 
-    console.log(`✅ Payment URL: ${finalPaymentUrl}`);
-
     await db.collection("pending_deposits").doc(orderId).update({
-      txnId: txnId,
-      paymentUrl: finalPaymentUrl,
-      qrUrl: qrUrl,
-      upiUrl: upiUrl
+      txnId,
+      paymentUrl: finalPaymentUrl
     });
+
+    console.log(`✅ Payment URL: ${finalPaymentUrl}`);
 
     res.json({
       ok: true,
-      orderId: orderId,
-      txnId: txnId,
-      paymentUrl: finalPaymentUrl,
-      qrUrl: qrUrl,
-      upiUrl: upiUrl
+      orderId,
+      txnId,
+      paymentUrl: finalPaymentUrl
     });
 
   } catch (err) {
@@ -156,7 +264,177 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// ═══════════ AMR Pay Webhook ═══════════
+// ═══════════ Process Deposit Bonuses (Referral + First Deposit) ═══════════
+async function processDepositBonuses(uid, depositAmount) {
+  try {
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists) return;
+    const userData = userSnap.data();
+
+    console.log(`🎁 Processing bonuses for ${uid}, deposit: ₹${depositAmount}`);
+
+    // First deposit bonus (agar pehli baar ₹100+ deposit)
+    if (!userData.firstDepositRewarded && depositAmount >= MIN_DEPOSIT_FOR_BONUS) {
+      await userRef.update({
+        bonusBalance: admin.firestore.FieldValue.increment(REFERRAL_FIRST_DEPOSIT_BONUS),
+        firstDepositRewarded: true
+      });
+      await db.collection("wallet_transactions").add({
+        uid,
+        amount: REFERRAL_FIRST_DEPOSIT_BONUS,
+        type: "credit",
+        isBonus: true,
+        description: `🎁 First Deposit Bonus (₹${MIN_DEPOSIT_FOR_BONUS}+)`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      await db.collection("notifications").add({
+        uid,
+        title: "🎁 First Deposit Bonus",
+        body: `₹${REFERRAL_FIRST_DEPOSIT_BONUS} bonus mila! Tournament join karne me use kar sakte ho.`,
+        read: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      console.log(`✅ First deposit bonus: ₹${REFERRAL_FIRST_DEPOSIT_BONUS} to ${uid}`);
+
+      // Referrer ko bonus do
+      const referrerUid = userData.referredBy;
+      if (referrerUid && !userData.referralRewarded) {
+        const referrerRef = db.collection("users").doc(referrerUid);
+        const referrerSnap = await referrerRef.get();
+        if (referrerSnap.exists) {
+          await referrerRef.update({
+            bonusBalance: admin.firestore.FieldValue.increment(REFERRER_BONUS)
+          });
+          await db.collection("wallet_transactions").add({
+            uid: referrerUid,
+            amount: REFERRER_BONUS,
+            type: "credit",
+            isBonus: true,
+            description: `🎁 Referral Bonus — ${userData.name || "Friend"}`,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+          await db.collection("notifications").add({
+            uid: referrerUid,
+            title: "🎁 Referral Bonus",
+            body: `${userData.name || "Aapke friend"} ne ₹${MIN_DEPOSIT_FOR_BONUS} deposit kiya! ₹${REFERRER_BONUS} bonus mila.`,
+            read: false,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+          await userRef.update({ referralRewarded: true });
+          console.log(`✅ Referrer bonus: ₹${REFERRER_BONUS} to ${referrerUid}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ processDepositBonuses error:", err);
+  }
+}
+
+// ═══════════ Credit User (Helper) ═══════════
+async function creditUser(pendingDoc, amount, utr, source = "polling") {
+  const pendingData = pendingDoc.data();
+  const uid = pendingData.uid;
+  if (!uid) throw new Error("No uid in pending deposit");
+
+  if (pendingData.status === "COMPLETED") {
+    console.log("✅ Already processed:", pendingData.txnId);
+    return { credited: false, alreadyProcessed: true };
+  }
+
+  const userRef = db.collection("users").doc(uid);
+
+  await db.runTransaction(async (tx) => {
+    const userSnap = await tx.get(userRef);
+    if (!userSnap.exists) throw new Error("User not found");
+    if (userSnap.data().banned === true) throw new Error("User banned");
+
+    const currentBal = Number(userSnap.data().balance || 0);
+    tx.update(userRef, { balance: currentBal + amount });
+
+    tx.update(pendingDoc.ref, {
+      status: "COMPLETED",
+      utr: utr || "",
+      creditedAmount: amount,
+      source,
+      completedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const txRef = db.collection("wallet_transactions").doc();
+    tx.set(txRef, {
+      uid,
+      amount,
+      type: "credit",
+      description: `Deposit — ${pendingData.txnId || ""}`,
+      txnId: pendingData.txnId || "",
+      utr: utr || "",
+      source: "amrpay",
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    const notifRef = db.collection("notifications").doc();
+    tx.set(notifRef, {
+      uid,
+      title: "✅ Deposit Credited",
+      body: `₹${amount} added to your wallet!`,
+      read: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  });
+
+  console.log(`✅ Credited ₹${amount} to ${uid} (via ${source})`);
+
+  // Bonuses process karo (first deposit + referral)
+  await processDepositBonuses(uid, amount);
+
+  return { credited: true, amount, uid };
+}
+
+// ═══════════ Check Status (Polling Endpoint) ═══════════
+app.get("/check-status/:orderId", async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const snap = await db.collection("pending_deposits").doc(orderId).get();
+    if (!snap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const data = snap.data();
+
+    if (data.status === "COMPLETED") {
+      return res.json({ ok: true, status: "COMPLETED", credited: true });
+    }
+
+    const txnId = data.txnId;
+    if (!txnId) {
+      return res.json({ ok: true, status: data.status, note: "No txn_id yet" });
+    }
+
+    const statusUrl = `${AMRPAY_STATUS_URL}?api_key=${encodeURIComponent(AMRPAY_API_KEY)}&txn_id=${encodeURIComponent(txnId)}`;
+    const statusResp = await fetch(statusUrl);
+    const statusText = await statusResp.text();
+    console.log("📥 Status response:", statusText.substring(0, 300));
+
+    let statusResult;
+    try { statusResult = JSON.parse(statusText); }
+    catch (e) { return res.json({ ok: false, error: "Status API response invalid" }); }
+
+    const sd = statusResult.data || statusResult;
+    const amrStatus = String(sd.status || statusResult.status || "").toLowerCase();
+
+    if (amrStatus === "success" || amrStatus === "completed" || amrStatus === "paid") {
+      const utr = sd.utr || sd.utr_number || "";
+      const creditResult = await creditUser(snap, Number(data.amount) || 0, utr, "polling");
+      return res.json({ ok: true, status: "COMPLETED", credited: creditResult.credited });
+    }
+
+    res.json({ ok: true, status: amrStatus || data.status, credited: false });
+
+  } catch (err) {
+    console.error("❌ Status check error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════ Webhook (AMR Pay) ═══════════
 app.post("/webhook", async (req, res) => {
   const data = req.body;
   console.log("🔔 AMR Pay webhook:", JSON.stringify(data, null, 2));
@@ -168,76 +446,23 @@ app.post("/webhook", async (req, res) => {
     const amount = Number(data.amount || 0);
     const utr = data.utr || "";
 
-    if (status !== "success") {
-      console.log("⏭️ Non-success status:", status);
-      return res.status(200).send("Ignored");
-    }
+    if (status !== "success") return res.status(200).send("Ignored");
 
     let pendingDoc = null;
-
     if (orderId) {
       const snap = await db.collection("pending_deposits").doc(orderId).get();
       if (snap.exists) pendingDoc = snap;
     }
-
     if (!pendingDoc && txnId) {
       const q = await db.collection("pending_deposits").where("txnId", "==", txnId).limit(1).get();
       if (!q.empty) pendingDoc = q.docs[0];
     }
-
     if (!pendingDoc) {
       console.warn("⚠️ No pending deposit for:", orderId, txnId);
       return res.status(200).send("Not found");
     }
 
-    const pendingData = pendingDoc.data();
-    if (pendingData.status === "COMPLETED") {
-      console.log("✅ Already processed");
-      return res.status(200).send("Already processed");
-    }
-
-    const uid = pendingData.uid;
-    const creditAmount = Number(pendingData.amount) || amount;
-    const userRef = db.collection("users").doc(uid);
-
-    await db.runTransaction(async (tx) => {
-      const userSnap = await tx.get(userRef);
-      if (!userSnap.exists) throw new Error("User not found");
-      if (userSnap.data().banned === true) throw new Error("User banned");
-
-      const currentBal = Number(userSnap.data().balance || 0);
-      tx.update(userRef, { balance: currentBal + creditAmount });
-
-      tx.update(pendingDoc.ref, {
-        status: "COMPLETED",
-        txnId: txnId,
-        utr: utr,
-        completedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const txRef = db.collection("wallet_transactions").doc();
-      tx.set(txRef, {
-        uid: uid,
-        amount: creditAmount,
-        type: "credit",
-        description: `AMR Pay Deposit — ${txnId || orderId}`,
-        txnId: txnId,
-        utr: utr,
-        source: "amrpay",
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const notifRef = db.collection("notifications").doc();
-      tx.set(notifRef, {
-        uid: uid,
-        title: "✅ Deposit Credited",
-        body: `₹${creditAmount} added to your wallet!`,
-        read: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    });
-
-    console.log(`✅ Credited ₹${creditAmount} to ${uid}`);
+    await creditUser(pendingDoc, amount || Number(pendingDoc.data().amount) || 0, utr, "webhook");
     res.status(200).send("OK");
 
   } catch (err) {
@@ -254,5 +479,5 @@ app.all("/payment-success", (req, res) => {
 // ═══════════ Start ═══════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 ArenaX AMR Pay Server running on port ${PORT}`);
+  console.log(`🚀 ArenaX Server running on port ${PORT}`);
 });
