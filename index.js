@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Instamojo Server — v8.0 (Diagnostic Mode)
+// ArenaX Instamojo Server — v9.0 (Production Only)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -18,7 +18,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ═══════════ Firebase Admin Init ═══════════
 let serviceAccount;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
@@ -45,32 +44,25 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ Config ═══════════
+// ✅ PRODUCTION ONLY
 const INSTAMOJO_API_KEY = process.env.INSTAMOJO_API_KEY || "";
 const INSTAMOJO_AUTH_TOKEN = process.env.INSTAMOJO_AUTH_TOKEN || "";
 const INSTAMOJO_SALT = process.env.INSTAMOJO_SALT || "";
-const INSTAMOJO_ENVIRONMENT = process.env.INSTAMOJO_ENVIRONMENT || "test";
-
-// ✅ Environment के हिसाब से सही URL
-const INSTAMOJO_BASE_URL = INSTAMOJO_ENVIRONMENT === "test"
-  ? "https://test.instamojo.com/api/1.1/"
-  : "https://www.instamojo.com/api/1.1/";
-
+const INSTAMOJO_ENVIRONMENT = process.env.INSTAMOJO_ENVIRONMENT || "production";
+const INSTAMOJO_BASE_URL = "https://www.instamojo.com/api/1.1/";
 const SERVER_URL = process.env.SERVER_URL || "https://arenax-webhook.onrender.com";
 
 console.log(`💳 Instamojo Env: ${INSTAMOJO_ENVIRONMENT}`);
 console.log(`💳 Instamojo URL: ${INSTAMOJO_BASE_URL}`);
 
-// ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Instamojo Server", status: "running", version: "8.0.0", env: INSTAMOJO_ENVIRONMENT, baseUrl: INSTAMOJO_BASE_URL });
+  res.json({ service: "ArenaX Instamojo Server", status: "running", version: "9.0.0", env: INSTAMOJO_ENVIRONMENT });
 });
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, ts: Date.now(), service: "arenax-instamojo", firebase: admin.apps.length > 0 ? "connected" : "disconnected", env: INSTAMOJO_ENVIRONMENT });
 });
 
-// ═══════════ Create Payment ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
@@ -82,12 +74,8 @@ app.post("/create-payment", async (req, res) => {
     const txnid = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
 
     await db.collection("pending_deposits").doc(txnid).set({
-      uid: uid,
-      txnid: txnid,
-      amount: Number(amount),
-      status: "PENDING",
-      gateway: "instamojo",
-      environment: INSTAMOJO_ENVIRONMENT,
+      uid: uid, txnid: txnid, amount: Number(amount),
+      status: "PENDING", gateway: "instamojo",
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
@@ -119,26 +107,17 @@ app.post("/create-payment", async (req, res) => {
       body: formData.toString()
     });
 
-    // ✅ Safe JSON handling
     const rawText = await instamojoResp.text();
-    console.log("📥 Instamojo RAW response (first 800 chars):", rawText.substring(0, 800));
+    console.log("📥 Instamojo RAW response:", rawText.substring(0, 500));
 
-    // अगर HTML मिला तो साफ़ error दो
-    if (rawText.trim().startsWith("<!DOCTYPE") || rawText.trim().startsWith("<html")) {
-      console.error("❌ Instamojo returned HTML — KYC incomplete or credentials mismatch");
-      return res.status(500).json({
-        ok: false,
-        error: "Instamojo account issue: KYC complete karo ya credentials check karo"
-      });
+    if (rawText.trim().startsWith("<")) {
+      console.error("❌ Instamojo returned HTML — credentials issue");
+      return res.status(500).json({ ok: false, error: "Instamojo credentials check karo" });
     }
 
     let result;
-    try {
-      result = JSON.parse(rawText);
-    } catch (parseErr) {
-      console.error("❌ Instamojo ne valid JSON nahi bheja");
-      return res.status(500).json({ ok: false, error: "Instamojo API response invalid" });
-    }
+    try { result = JSON.parse(rawText); }
+    catch (e) { return res.status(500).json({ ok: false, error: "Instamojo API response invalid" }); }
 
     if (!result.success) {
       return res.status(500).json({ ok: false, error: result.message || "Instamojo error" });
@@ -148,12 +127,7 @@ app.post("/create-payment", async (req, res) => {
       paymentRequestId: result.payment_request.id
     });
 
-    res.json({
-      ok: true,
-      txnid: txnid,
-      paymentRequestId: result.payment_request.id,
-      longurl: result.payment_request.longurl
-    });
+    res.json({ ok: true, txnid, paymentRequestId: result.payment_request.id, longurl: result.payment_request.longurl });
 
   } catch (err) {
     console.error("❌ Create payment error:", err);
@@ -161,7 +135,6 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// ═══════════ Instamojo Webhook ═══════════
 app.post("/instamojo-webhook", async (req, res) => {
   const data = req.body;
   console.log("🔔 Instamojo webhook:", JSON.stringify(data, null, 2));
@@ -188,8 +161,7 @@ app.post("/instamojo-webhook", async (req, res) => {
     if (data.status !== "Credit") return res.status(200).send("Ignored");
 
     const pendingQ = await db.collection("pending_deposits")
-      .where("paymentRequestId", "==", data.payment_request_id)
-      .limit(1).get();
+      .where("paymentRequestId", "==", data.payment_request_id).limit(1).get();
 
     if (pendingQ.empty) return res.status(200).send("Not found");
 
@@ -207,8 +179,7 @@ app.post("/instamojo-webhook", async (req, res) => {
       const currentBal = Number(userSnap.data().balance || 0);
       tx.update(userRef, { balance: currentBal + amount });
       tx.update(pendingDoc.ref, {
-        status: "COMPLETED",
-        paymentId: data.payment_id || "",
+        status: "COMPLETED", paymentId: data.payment_id || "",
         completedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       const txRef = db.collection("wallet_transactions").doc();
@@ -234,12 +205,10 @@ app.post("/instamojo-webhook", async (req, res) => {
   }
 });
 
-// ═══════════ Payment Success ═══════════
 app.all("/payment-success", (req, res) => {
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Aap is page ko band kar sakte ho. Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>function tryClose(){window.open('','_self','');window.close();setTimeout(function(){if(document.referrer)history.back()},100)}setTimeout(tryClose,5000)</script></body></html>`);
 });
 
-// ═══════════ Start ═══════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX Instamojo running on port ${PORT}`);
