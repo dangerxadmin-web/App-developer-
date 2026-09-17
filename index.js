@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX AMR Pay Server — v1.0
+// ArenaX AMR Pay Server — v2.0 (Payment URL Fixed)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -47,14 +47,12 @@ const db = admin.firestore();
 // ═══════════ AMR Pay Config ═══════════
 const AMRPAY_API_KEY = (process.env.AMRPAY_API_KEY || "").trim();
 const AMRPAY_CREATE_URL = "https://amrpay.com/api/create-transaction.php";
-const AMRPAY_STATUS_URL = "https://amrpay.com/api/status.php";
 
 console.log(`💳 AMR Pay API Key: ${AMRPAY_API_KEY.substring(0, 20)}...`);
-console.log(`💳 Create URL: ${AMRPAY_CREATE_URL}`);
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX AMR Pay Server", status: "running", version: "1.0.0" });
+  res.json({ service: "ArenaX AMR Pay Server", status: "running", version: "2.0.0" });
 });
 
 app.get("/health", (req, res) => {
@@ -77,7 +75,6 @@ app.post("/create-payment", async (req, res) => {
 
     const orderId = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
 
-    // Firestore me pending deposit save karo
     await db.collection("pending_deposits").doc(orderId).set({
       uid: uid,
       orderId: orderId,
@@ -87,7 +84,6 @@ app.post("/create-payment", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // AMR Pay API call
     const payload = {
       api_key: AMRPAY_API_KEY,
       order_id: orderId,
@@ -107,7 +103,7 @@ app.post("/create-payment", async (req, res) => {
     });
 
     const rawText = await amrResp.text();
-    console.log("📥 AMR Pay RAW response:", rawText.substring(0, 500));
+    console.log("📥 AMR Pay RAW response:", rawText.substring(0, 800));
 
     let result;
     try {
@@ -117,25 +113,33 @@ app.post("/create-payment", async (req, res) => {
       return res.status(500).json({ ok: false, error: "AMR Pay response invalid" });
     }
 
-    if (!result.success && !result.txn_id) {
-      return res.status(500).json({ ok: false, error: result.message || "AMR Pay error" });
+    // ✅ FIX: txn_id multiple possible field names se dhundo
+    const txnId = result.txn_id || result.txnId || result.transaction_id || result.id || "";
+    const paymentUrl = result.payment_url || result.paymentUrl || result.url || "";
+
+    if (!txnId && !paymentUrl) {
+      console.error("❌ No txn_id or payment_url in response:", JSON.stringify(result));
+      return res.status(500).json({ ok: false, error: "AMR Pay ne txn_id nahi bheja" });
     }
 
-    // txn_id aur payment URL save karo
+    // ✅ FIX: Agar payment_url diya hai toh wahi use karo, warna txn_id se banao
+    let finalPaymentUrl = paymentUrl;
+    if (!finalPaymentUrl && txnId) {
+      finalPaymentUrl = "https://amrpay.com/pay.php?txn_id=" + encodeURIComponent(txnId);
+    }
+
+    console.log(`✅ Payment URL: ${finalPaymentUrl}`);
+
     await db.collection("pending_deposits").doc(orderId).update({
-      txnId: result.txn_id || "",
-      paymentUrl: result.payment_url || ("https://amrpay.com/pay.php?txn_id=" + (result.txn_id || "")),
-      qrUrl: result.qr_url || "",
-      upiIntent: result.upi_intent || ""
+      txnId: txnId,
+      paymentUrl: finalPaymentUrl
     });
 
     res.json({
       ok: true,
       orderId: orderId,
-      txnId: result.txn_id || "",
-      paymentUrl: result.payment_url || ("https://amrpay.com/pay.php?txn_id=" + (result.txn_id || "")),
-      qrUrl: result.qr_url || "",
-      upiIntent: result.upi_intent || ""
+      txnId: txnId,
+      paymentUrl: finalPaymentUrl
     });
 
   } catch (err) {
@@ -151,7 +155,7 @@ app.post("/webhook", async (req, res) => {
 
   try {
     const status = String(data.status || "").toLowerCase();
-    const txnId = data.txn_id || "";
+    const txnId = data.txn_id || data.txnId || "";
     const orderId = data.order_id || "";
     const amount = Number(data.amount || 0);
     const utr = data.utr || "";
@@ -161,11 +165,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("Ignored");
     }
 
-    if (!orderId && !txnId) {
-      return res.status(400).send("No order_id or txn_id");
-    }
-
-    // Firestore me pending deposit dhundo
     let pendingDoc = null;
 
     if (orderId) {
@@ -236,29 +235,6 @@ app.post("/webhook", async (req, res) => {
   } catch (err) {
     console.error("❌ Webhook error:", err);
     res.status(500).send("Error");
-  }
-});
-
-// ═══════════ Status Check (Backup) ═══════════
-app.get("/check-status/:orderId", async (req, res) => {
-  try {
-    const orderId = req.params.orderId;
-    const snap = await db.collection("pending_deposits").doc(orderId).get();
-    if (!snap.exists) return res.status(404).json({ ok: false, error: "Not found" });
-
-    const data = snap.data();
-    const txnId = data.txnId;
-
-    if (!txnId) return res.json({ ok: true, status: data.status, note: "No txn_id yet" });
-
-    const url = `${AMRPAY_STATUS_URL}?api_key=${AMRPAY_API_KEY}&txn_id=${txnId}`;
-    const resp = await fetch(url);
-    const result = await resp.json();
-
-    res.json({ ok: true, amrpay: result, local: data.status });
-
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
