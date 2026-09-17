@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX AMR Pay Server — v2.0 (Payment URL Fixed)
+// ArenaX AMR Pay Server — v3.0 (Nested Response Fixed)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -52,7 +52,7 @@ console.log(`💳 AMR Pay API Key: ${AMRPAY_API_KEY.substring(0, 20)}...`);
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX AMR Pay Server", status: "running", version: "2.0.0" });
+  res.json({ service: "ArenaX AMR Pay Server", status: "running", version: "3.0.0" });
 });
 
 app.get("/health", (req, res) => {
@@ -113,16 +113,20 @@ app.post("/create-payment", async (req, res) => {
       return res.status(500).json({ ok: false, error: "AMR Pay response invalid" });
     }
 
-    // ✅ FIX: txn_id multiple possible field names se dhundo
-    const txnId = result.txn_id || result.txnId || result.transaction_id || result.id || "";
-    const paymentUrl = result.payment_url || result.paymentUrl || result.url || "";
+    // ✅ FIX: Nested data object se fields nikalo
+    const d = result.data || result;
+
+    const txnId = d.txn_id || d.txnId || d.transaction_id || d.id || "";
+    const paymentUrl = d.payment_url || d.paymentUrl || d.url || "";
+    const qrUrl = d.qr_url || d.qrUrl || "";
+    const upiUrl = d.upi_url || d.upiUrl || d.upi_intent || "";
 
     if (!txnId && !paymentUrl) {
       console.error("❌ No txn_id or payment_url in response:", JSON.stringify(result));
       return res.status(500).json({ ok: false, error: "AMR Pay ne txn_id nahi bheja" });
     }
 
-    // ✅ FIX: Agar payment_url diya hai toh wahi use karo, warna txn_id se banao
+    // ✅ Payment URL fallback
     let finalPaymentUrl = paymentUrl;
     if (!finalPaymentUrl && txnId) {
       finalPaymentUrl = "https://amrpay.com/pay.php?txn_id=" + encodeURIComponent(txnId);
@@ -132,14 +136,18 @@ app.post("/create-payment", async (req, res) => {
 
     await db.collection("pending_deposits").doc(orderId).update({
       txnId: txnId,
-      paymentUrl: finalPaymentUrl
+      paymentUrl: finalPaymentUrl,
+      qrUrl: qrUrl,
+      upiUrl: upiUrl
     });
 
     res.json({
       ok: true,
       orderId: orderId,
       txnId: txnId,
-      paymentUrl: finalPaymentUrl
+      paymentUrl: finalPaymentUrl,
+      qrUrl: qrUrl,
+      upiUrl: upiUrl
     });
 
   } catch (err) {
