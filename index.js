@@ -1,10 +1,9 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Instamojo Server — v9.0 (Production Only)
+// ArenaX AMR Pay Server — v1.0
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
 const admin = require("firebase-admin");
-const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -18,12 +17,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// ═══════════ Firebase Init ═══════════
 let serviceAccount;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
     const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf-8");
     serviceAccount = JSON.parse(decoded);
-    console.log("✅ Firebase SA loaded from BASE64");
+    console.log("✅ Firebase SA loaded");
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   } else if (process.env.NODE_ENV !== "production") {
@@ -44,25 +44,24 @@ try {
 
 const db = admin.firestore();
 
-// ✅ PRODUCTION ONLY
-const INSTAMOJO_API_KEY = process.env.INSTAMOJO_API_KEY || "";
-const INSTAMOJO_AUTH_TOKEN = process.env.INSTAMOJO_AUTH_TOKEN || "";
-const INSTAMOJO_SALT = process.env.INSTAMOJO_SALT || "";
-const INSTAMOJO_ENVIRONMENT = process.env.INSTAMOJO_ENVIRONMENT || "production";
-const INSTAMOJO_BASE_URL = "https://www.instamojo.com/api/1.1/";
-const SERVER_URL = process.env.SERVER_URL || "https://arenax-webhook.onrender.com";
+// ═══════════ AMR Pay Config ═══════════
+const AMRPAY_API_KEY = (process.env.AMRPAY_API_KEY || "").trim();
+const AMRPAY_CREATE_URL = "https://amrpay.com/api/create-transaction.php";
+const AMRPAY_STATUS_URL = "https://amrpay.com/api/status.php";
 
-console.log(`💳 Instamojo Env: ${INSTAMOJO_ENVIRONMENT}`);
-console.log(`💳 Instamojo URL: ${INSTAMOJO_BASE_URL}`);
+console.log(`💳 AMR Pay API Key: ${AMRPAY_API_KEY.substring(0, 20)}...`);
+console.log(`💳 Create URL: ${AMRPAY_CREATE_URL}`);
 
+// ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Instamojo Server", status: "running", version: "9.0.0", env: INSTAMOJO_ENVIRONMENT });
+  res.json({ service: "ArenaX AMR Pay Server", status: "running", version: "1.0.0" });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now(), service: "arenax-instamojo", firebase: admin.apps.length > 0 ? "connected" : "disconnected", env: INSTAMOJO_ENVIRONMENT });
+  res.json({ ok: true, ts: Date.now(), service: "arenax-amrpay", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
 });
 
+// ═══════════ Create Payment ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
@@ -71,63 +70,73 @@ app.post("/create-payment", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid uid or amount (min ₹10)" });
     }
 
-    const txnid = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
+    if (!AMRPAY_API_KEY) {
+      console.error("❌ AMRPAY_API_KEY not set");
+      return res.status(500).json({ ok: false, error: "AMR Pay API key missing on server" });
+    }
 
-    await db.collection("pending_deposits").doc(txnid).set({
-      uid: uid, txnid: txnid, amount: Number(amount),
-      status: "PENDING", gateway: "instamojo",
+    const orderId = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    // Firestore me pending deposit save karo
+    await db.collection("pending_deposits").doc(orderId).set({
+      uid: uid,
+      orderId: orderId,
+      amount: Number(amount),
+      status: "PENDING",
+      gateway: "amrpay",
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    const formattedAmount = Number(amount).toFixed(2);
-    const cleanPhone = String(phone || "9999999999").replace(/[^0-9]/g, "").slice(-10);
-    const cleanEmail = (email || "user@arenax.app").trim().toLowerCase();
+    // AMR Pay API call
+    const payload = {
+      api_key: AMRPAY_API_KEY,
+      order_id: orderId,
+      amount: Number(amount),
+      customer_name: (name || "Player").substring(0, 100),
+      customer_email: (email || "user@arenax.app").trim().toLowerCase(),
+      customer_mobile: String(phone || "9999999999").replace(/[^0-9]/g, "").slice(-10),
+      remark: "ArenaX Wallet Topup"
+    };
 
-    const formData = new URLSearchParams();
-    formData.append("purpose", "ArenaX Wallet Topup");
-    formData.append("amount", formattedAmount);
-    formData.append("buyer_name", (name || "Player").substring(0, 100));
-    formData.append("email", cleanEmail);
-    formData.append("phone", cleanPhone);
-    formData.append("redirect_url", SERVER_URL + "/payment-success");
-    formData.append("webhook", SERVER_URL + "/instamojo-webhook");
-    formData.append("send_email", "false");
-    formData.append("send_sms", "false");
-    formData.append("allow_repeated_payments", "false");
+    console.log("📤 AMR Pay create request:", JSON.stringify(payload));
 
-    console.log(`📤 Calling: ${INSTAMOJO_BASE_URL}payment-requests/`);
-
-    const instamojoResp = await fetch(INSTAMOJO_BASE_URL + "payment-requests/", {
+    const amrResp = await fetch(AMRPAY_CREATE_URL, {
       method: "POST",
-      headers: {
-        "X-Api-Key": INSTAMOJO_API_KEY,
-        "X-Auth-Token": INSTAMOJO_AUTH_TOKEN,
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: formData.toString()
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
     });
 
-    const rawText = await instamojoResp.text();
-    console.log("📥 Instamojo RAW response:", rawText.substring(0, 500));
-
-    if (rawText.trim().startsWith("<")) {
-      console.error("❌ Instamojo returned HTML — credentials issue");
-      return res.status(500).json({ ok: false, error: "Instamojo credentials check karo" });
-    }
+    const rawText = await amrResp.text();
+    console.log("📥 AMR Pay RAW response:", rawText.substring(0, 500));
 
     let result;
-    try { result = JSON.parse(rawText); }
-    catch (e) { return res.status(500).json({ ok: false, error: "Instamojo API response invalid" }); }
-
-    if (!result.success) {
-      return res.status(500).json({ ok: false, error: result.message || "Instamojo error" });
+    try {
+      result = JSON.parse(rawText);
+    } catch (e) {
+      console.error("❌ AMR Pay ne JSON nahi bheja");
+      return res.status(500).json({ ok: false, error: "AMR Pay response invalid" });
     }
 
-    await db.collection("pending_deposits").doc(txnid).update({
-      paymentRequestId: result.payment_request.id
+    if (!result.success && !result.txn_id) {
+      return res.status(500).json({ ok: false, error: result.message || "AMR Pay error" });
+    }
+
+    // txn_id aur payment URL save karo
+    await db.collection("pending_deposits").doc(orderId).update({
+      txnId: result.txn_id || "",
+      paymentUrl: result.payment_url || ("https://amrpay.com/pay.php?txn_id=" + (result.txn_id || "")),
+      qrUrl: result.qr_url || "",
+      upiIntent: result.upi_intent || ""
     });
 
-    res.json({ ok: true, txnid, paymentRequestId: result.payment_request.id, longurl: result.payment_request.longurl });
+    res.json({
+      ok: true,
+      orderId: orderId,
+      txnId: result.txn_id || "",
+      paymentUrl: result.payment_url || ("https://amrpay.com/pay.php?txn_id=" + (result.txn_id || "")),
+      qrUrl: result.qr_url || "",
+      upiIntent: result.upi_intent || ""
+    });
 
   } catch (err) {
     console.error("❌ Create payment error:", err);
@@ -135,81 +144,131 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-app.post("/instamojo-webhook", async (req, res) => {
+// ═══════════ AMR Pay Webhook ═══════════
+app.post("/webhook", async (req, res) => {
   const data = req.body;
-  console.log("🔔 Instamojo webhook:", JSON.stringify(data, null, 2));
+  console.log("🔔 AMR Pay webhook:", JSON.stringify(data, null, 2));
 
   try {
-    const receivedMac = data.mac;
-    if (!receivedMac) return res.status(400).send("No MAC");
+    const status = String(data.status || "").toLowerCase();
+    const txnId = data.txn_id || "";
+    const orderId = data.order_id || "";
+    const amount = Number(data.amount || 0);
+    const utr = data.utr || "";
 
-    const macData = [
-      data.payment_id, data.payment_request_id, data.status,
-      data.amount, data.buyer_name, data.buyer_email, data.buyer_phone
-    ].filter(Boolean).join("|");
-
-    const hmac = crypto.createHmac("sha1", INSTAMOJO_SALT);
-    hmac.update(macData);
-    const calculatedMac = hmac.digest("hex");
-
-    if (calculatedMac !== receivedMac) {
-      console.warn("⚠️ MAC mismatch");
-      return res.status(400).send("Invalid MAC");
+    if (status !== "success") {
+      console.log("⏭️ Non-success status:", status);
+      return res.status(200).send("Ignored");
     }
-    console.log("✅ MAC verified");
 
-    if (data.status !== "Credit") return res.status(200).send("Ignored");
+    if (!orderId && !txnId) {
+      return res.status(400).send("No order_id or txn_id");
+    }
 
-    const pendingQ = await db.collection("pending_deposits")
-      .where("paymentRequestId", "==", data.payment_request_id).limit(1).get();
+    // Firestore me pending deposit dhundo
+    let pendingDoc = null;
 
-    if (pendingQ.empty) return res.status(200).send("Not found");
+    if (orderId) {
+      const snap = await db.collection("pending_deposits").doc(orderId).get();
+      if (snap.exists) pendingDoc = snap;
+    }
 
-    const pendingDoc = pendingQ.docs[0];
+    if (!pendingDoc && txnId) {
+      const q = await db.collection("pending_deposits").where("txnId", "==", txnId).limit(1).get();
+      if (!q.empty) pendingDoc = q.docs[0];
+    }
+
+    if (!pendingDoc) {
+      console.warn("⚠️ No pending deposit for:", orderId, txnId);
+      return res.status(200).send("Not found");
+    }
+
     const pendingData = pendingDoc.data();
-    if (pendingData.status === "COMPLETED") return res.status(200).send("Already processed");
+    if (pendingData.status === "COMPLETED") {
+      console.log("✅ Already processed");
+      return res.status(200).send("Already processed");
+    }
 
     const uid = pendingData.uid;
-    const amount = Number(pendingData.amount);
+    const creditAmount = Number(pendingData.amount) || amount;
     const userRef = db.collection("users").doc(uid);
 
     await db.runTransaction(async (tx) => {
       const userSnap = await tx.get(userRef);
       if (!userSnap.exists) throw new Error("User not found");
+      if (userSnap.data().banned === true) throw new Error("User banned");
+
       const currentBal = Number(userSnap.data().balance || 0);
-      tx.update(userRef, { balance: currentBal + amount });
+      tx.update(userRef, { balance: currentBal + creditAmount });
+
       tx.update(pendingDoc.ref, {
-        status: "COMPLETED", paymentId: data.payment_id || "",
+        status: "COMPLETED",
+        txnId: txnId,
+        utr: utr,
         completedAt: admin.firestore.FieldValue.serverTimestamp()
       });
+
       const txRef = db.collection("wallet_transactions").doc();
       tx.set(txRef, {
-        uid: uid, amount: amount, type: "credit",
-        description: `Instamojo Deposit — ${data.payment_id}`,
-        paymentId: data.payment_id || "",
+        uid: uid,
+        amount: creditAmount,
+        type: "credit",
+        description: `AMR Pay Deposit — ${txnId || orderId}`,
+        txnId: txnId,
+        utr: utr,
+        source: "amrpay",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
+
       const notifRef = db.collection("notifications").doc();
       tx.set(notifRef, {
-        uid: uid, title: "✅ Deposit Credited",
-        body: `₹${amount} added to your wallet!`,
-        read: false, createdAt: admin.firestore.FieldValue.serverTimestamp()
+        uid: uid,
+        title: "✅ Deposit Credited",
+        body: `₹${creditAmount} added to your wallet!`,
+        read: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
     });
 
-    console.log(`✅ Credited ₹${amount} to ${uid}`);
+    console.log(`✅ Credited ₹${creditAmount} to ${uid}`);
     res.status(200).send("OK");
+
   } catch (err) {
     console.error("❌ Webhook error:", err);
     res.status(500).send("Error");
   }
 });
 
+// ═══════════ Status Check (Backup) ═══════════
+app.get("/check-status/:orderId", async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const snap = await db.collection("pending_deposits").doc(orderId).get();
+    if (!snap.exists) return res.status(404).json({ ok: false, error: "Not found" });
+
+    const data = snap.data();
+    const txnId = data.txnId;
+
+    if (!txnId) return res.json({ ok: true, status: data.status, note: "No txn_id yet" });
+
+    const url = `${AMRPAY_STATUS_URL}?api_key=${AMRPAY_API_KEY}&txn_id=${txnId}`;
+    const resp = await fetch(url);
+    const result = await resp.json();
+
+    res.json({ ok: true, amrpay: result, local: data.status });
+
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ═══════════ Payment Success Page ═══════════
 app.all("/payment-success", (req, res) => {
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Aap is page ko band kar sakte ho. Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>function tryClose(){window.open('','_self','');window.close();setTimeout(function(){if(document.referrer)history.back()},100)}setTimeout(tryClose,5000)</script></body></html>`);
 });
 
+// ═══════════ Start ═══════════
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 ArenaX Instamojo running on port ${PORT}`);
+  console.log(`🚀 ArenaX AMR Pay Server running on port ${PORT}`);
 });
