@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Instamojo Server — v6.0 (V1.1 API)
+// ArenaX Instamojo Server — v8.0 (Diagnostic Mode)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -49,10 +49,12 @@ const db = admin.firestore();
 const INSTAMOJO_API_KEY = process.env.INSTAMOJO_API_KEY || "";
 const INSTAMOJO_AUTH_TOKEN = process.env.INSTAMOJO_AUTH_TOKEN || "";
 const INSTAMOJO_SALT = process.env.INSTAMOJO_SALT || "";
-const INSTAMOJO_ENVIRONMENT = process.env.INSTAMOJO_ENVIRONMENT || "production";
+const INSTAMOJO_ENVIRONMENT = process.env.INSTAMOJO_ENVIRONMENT || "test";
 
-// ✅ V1.1 endpoint (X-Api-Key + X-Auth-Token ke saath)
-const INSTAMOJO_BASE_URL = "https://www.instamojo.com/api/1.1/";
+// ✅ Environment के हिसाब से सही URL
+const INSTAMOJO_BASE_URL = INSTAMOJO_ENVIRONMENT === "test"
+  ? "https://test.instamojo.com/api/1.1/"
+  : "https://www.instamojo.com/api/1.1/";
 
 const SERVER_URL = process.env.SERVER_URL || "https://arenax-webhook.onrender.com";
 
@@ -61,7 +63,7 @@ console.log(`💳 Instamojo URL: ${INSTAMOJO_BASE_URL}`);
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Instamojo Server", status: "running", version: "6.0.0", env: INSTAMOJO_ENVIRONMENT });
+  res.json({ service: "ArenaX Instamojo Server", status: "running", version: "8.0.0", env: INSTAMOJO_ENVIRONMENT, baseUrl: INSTAMOJO_BASE_URL });
 });
 
 app.get("/health", (req, res) => {
@@ -89,16 +91,10 @@ app.post("/create-payment", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // ✅ FIX: Amount ko 2 decimal places me bhejo
     const formattedAmount = Number(amount).toFixed(2);
-
-    // ✅ FIX: Phone 10 digits only
     const cleanPhone = String(phone || "9999999999").replace(/[^0-9]/g, "").slice(-10);
-
-    // ✅ FIX: Email clean
     const cleanEmail = (email || "user@arenax.app").trim().toLowerCase();
 
-    // ✅ V1.1 API: x-www-form-urlencoded
     const formData = new URLSearchParams();
     formData.append("purpose", "ArenaX Wallet Topup");
     formData.append("amount", formattedAmount);
@@ -111,10 +107,9 @@ app.post("/create-payment", async (req, res) => {
     formData.append("send_sms", "false");
     formData.append("allow_repeated_payments", "false");
 
-    console.log("📤 Instamojo API call:", txnid, "amount:", formattedAmount);
+    console.log(`📤 Calling: ${INSTAMOJO_BASE_URL}payment-requests/`);
 
-    // ✅ V1.1 endpoint + X-Api-Key / X-Auth-Token headers
-    const instamojoResp = await fetch(INSTAMOJO_BASE_URL + "/payment-requests/", {
+    const instamojoResp = await fetch(INSTAMOJO_BASE_URL + "payment-requests/", {
       method: "POST",
       headers: {
         "X-Api-Key": INSTAMOJO_API_KEY,
@@ -124,8 +119,26 @@ app.post("/create-payment", async (req, res) => {
       body: formData.toString()
     });
 
-    const result = await instamojoResp.json();
-    console.log("📥 Instamojo response:", JSON.stringify(result).substring(0, 300));
+    // ✅ Safe JSON handling
+    const rawText = await instamojoResp.text();
+    console.log("📥 Instamojo RAW response (first 800 chars):", rawText.substring(0, 800));
+
+    // अगर HTML मिला तो साफ़ error दो
+    if (rawText.trim().startsWith("<!DOCTYPE") || rawText.trim().startsWith("<html")) {
+      console.error("❌ Instamojo returned HTML — KYC incomplete or credentials mismatch");
+      return res.status(500).json({
+        ok: false,
+        error: "Instamojo account issue: KYC complete karo ya credentials check karo"
+      });
+    }
+
+    let result;
+    try {
+      result = JSON.parse(rawText);
+    } catch (parseErr) {
+      console.error("❌ Instamojo ne valid JSON nahi bheja");
+      return res.status(500).json({ ok: false, error: "Instamojo API response invalid" });
+    }
 
     if (!result.success) {
       return res.status(500).json({ ok: false, error: result.message || "Instamojo error" });
