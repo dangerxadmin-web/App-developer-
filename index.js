@@ -52,9 +52,7 @@ const INSTAMOJO_SALT = process.env.INSTAMOJO_SALT || "";
 const INSTAMOJO_ENVIRONMENT = process.env.INSTAMOJO_ENVIRONMENT || "production";
 
 // ✅ V1.1 endpoint (X-Api-Key + X-Auth-Token ke saath)
-const INSTAMOJO_BASE_URL = INSTAMOJO_ENVIRONMENT === "test"
-  ? "https://test.instamojo.com/api/1.1"
-  : "https://www.instamojo.com/api/1.1";
+const INSTAMOJO_BASE_URL = "https://www.instamojo.com/api/1.1/";
 
 const SERVER_URL = process.env.SERVER_URL || "https://arenax-webhook.onrender.com";
 
