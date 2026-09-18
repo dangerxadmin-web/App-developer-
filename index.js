@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Server — v8.0 (PayPal Sandbox + Referral + Bonus)
+// ArenaX Server — v9.0 (PayPal + Referral + Bonus + Fast)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -45,11 +45,11 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ Config — PayPal Sandbox ═══════════
-const PAYPAL_CLIENT_ID = (process.env.PAYPAL_CLIENT_ID || "BAAotApswZx-v_n-wFIbTtMGqcFNg-yZV3MJn07JWd6xq748jaW_hnkvtjaKphoenuuBrpkcOC7pwCLj6I").trim();
-const PAYPAL_CLIENT_SECRET = (process.env.PAYPAL_CLIENT_SECRET || "EAw_u2WKYVv4d8SolxGtfy6raMacGGGoDEiFNYcVFrd8llo_tqQxuuX1yc2pGmR4WQjPrF5yxq026iTv").trim();
+// ═══════════ Config ═══════════
+const PAYPAL_CLIENT_ID = (process.env.PAYPAL_CLIENT_ID || "").trim();
+const PAYPAL_CLIENT_SECRET = (process.env.PAYPAL_CLIENT_SECRET || "").trim();
 const PAYPAL_WEBHOOK_ID = (process.env.PAYPAL_WEBHOOK_ID || "").trim();
-const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; // Sandbox URL
+const PAYPAL_API_BASE = process.env.PAYPAL_API_BASE || "https://api-m.sandbox.paypal.com";
 const PAYPAL_CURRENCY = "USD";
 
 // Referral & Bonus Config
@@ -58,11 +58,9 @@ const REFERRAL_FIRST_DEPOSIT_BONUS = 20;
 const REFERRER_BONUS = 5;
 const MIN_DEPOSIT_FOR_BONUS = 100;
 
-console.log(`💳 PayPal Client ID: ${PAYPAL_CLIENT_ID.substring(0, 20)}...`);
-console.log(`💳 PayPal Mode: SANDBOX`);
-console.log(`🔗 Webhook ID: ${PAYPAL_WEBHOOK_ID ? "SET" : "NOT SET (verification will be skipped)"}`);
+console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 
-// ═══════════ PayPal Access Token Helper ═══════════
+// ═══════════ PayPal Access Token ═══════════
 async function getPayPalAccessToken() {
   const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
   const resp = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
@@ -74,17 +72,17 @@ async function getPayPalAccessToken() {
     body: "grant_type=client_credentials"
   });
   const data = await resp.json();
-  if (!data.access_token) throw new Error("Failed to get PayPal access token: " + JSON.stringify(data));
+  if (!data.access_token) throw new Error("PayPal access token failed: " + JSON.stringify(data));
   return data.access_token;
 }
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Server", status: "running", version: "8.0.0", gateway: "paypal-sandbox" });
+  res.json({ service: "ArenaX Server", status: "running", version: "9.0.0", gateway: "paypal" });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now(), service: "arenax", firebase: admin.apps.length > 0 ? "connected" : "disconnected", paypal: "sandbox" });
+  res.json({ ok: true, ts: Date.now(), service: "arenax", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
 });
 
 // ═══════════ Referral Code Generate ═══════════
@@ -93,32 +91,6 @@ function generateReferralCode(name) {
   const num = Math.floor(100 + Math.random() * 900);
   return clean + num;
 }
-
-// ═══════════ Verify Referral Code ═══════════
-app.post("/verify-referral", async (req, res) => {
-  try {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ ok: false, error: "Code required" });
-
-    const refCode = String(code).trim().toUpperCase();
-    const q = await db.collection("users").where("referralCode", "==", refCode).limit(1).get();
-
-    if (q.empty) return res.json({ ok: false, valid: false, error: "Invalid referral code" });
-
-    const referrerDoc = q.docs[0];
-    const referrerData = referrerDoc.data();
-
-    res.json({
-      ok: true,
-      valid: true,
-      referrerUid: referrerDoc.id,
-      referrerName: referrerData.name || "Player"
-    });
-  } catch (err) {
-    console.error("❌ Verify referral error:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
 
 // ═══════════ Create User (Signup with Referral) ═══════════
 app.post("/create-user", async (req, res) => {
@@ -129,6 +101,29 @@ app.post("/create-user", async (req, res) => {
       return res.status(400).json({ ok: false, error: "uid, name, email required" });
     }
 
+    // Check if user already exists
+    const userRef = db.collection("users").doc(uid);
+    const userSnap = await userRef.get();
+    if (userSnap.exists) {
+      return res.json({ ok: true, alreadyExists: true });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    // ═══ DUPLICATE EMAIL CHECK ═══
+    const dupEmail = await db.collection("users")
+      .where("email", "==", normalizedEmail)
+      .limit(1)
+      .get();
+    
+    if (!dupEmail.empty && dupEmail.docs[0].id !== uid) {
+      return res.status(400).json({ 
+        ok: false, 
+        error: "This email is already registered. Please login instead." 
+      });
+    }
+
+    // ═══ REFERRAL CODE VERIFY (agar diya) ═══
     let referrerUid = null;
     if (referralCode) {
       const refCode = String(referralCode).trim().toUpperCase();
@@ -136,22 +131,20 @@ app.post("/create-user", async (req, res) => {
       if (!q.empty) {
         referrerUid = q.docs[0].id;
         console.log(`🎁 Referral detected: ${refCode} → ${referrerUid}`);
+      } else {
+        console.log(`⚠️ Invalid referral code: ${refCode} (skipped)`);
       }
     }
 
+    // Generate own referral code
     const myRefCode = generateReferralCode(name);
     const signupBonus = referrerUid ? REFERRAL_SIGNUP_BONUS : 0;
 
-    const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-    if (userSnap.exists) {
-      return res.json({ ok: true, alreadyExists: true });
-    }
-
+    // ═══ CREATE USER DOC ═══
     await userRef.set({
       uid,
       name,
-      email,
+      email: normalizedEmail,
       phone: phone || "",
       photoURL: "",
       balance: 0,
@@ -159,6 +152,7 @@ app.post("/create-user", async (req, res) => {
       gameUid: "",
       ign: "",
       matchesPlayed: 0,
+      totalWon: 0,
       banned: false,
       referralCode: myRefCode,
       referredBy: referrerUid || "",
@@ -167,6 +161,9 @@ app.post("/create-user", async (req, res) => {
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+    console.log(`✅ User created: ${uid} (refCode: ${myRefCode}, referredBy: ${referrerUid || "none"}, bonus: ₹${signupBonus})`);
+
+    // ═══ SIGNUP BONUS LOG (agar referral se aaya) ═══
     if (signupBonus > 0) {
       await db.collection("wallet_transactions").add({
         uid,
@@ -185,8 +182,6 @@ app.post("/create-user", async (req, res) => {
       });
     }
 
-    console.log(`✅ User created: ${uid} (refCode: ${myRefCode}, referredBy: ${referrerUid || "none"})`);
-
     res.json({
       ok: true,
       referralCode: myRefCode,
@@ -200,37 +195,53 @@ app.post("/create-user", async (req, res) => {
   }
 });
 
+// ═══════════ Verify Referral Code (Optional — User Panel me use nahi hoga) ═══════════
+app.post("/verify-referral", async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ ok: false, error: "Code required" });
+    const refCode = String(code).trim().toUpperCase();
+    const q = await db.collection("users").where("referralCode", "==", refCode).limit(1).get();
+    if (q.empty) return res.json({ ok: false, valid: false, error: "Invalid referral code" });
+    const referrerDoc = q.docs[0];
+    const referrerData = referrerDoc.data();
+    res.json({
+      ok: true,
+      valid: true,
+      referrerUid: referrerDoc.id,
+      referrerName: referrerData.name || "Player"
+    });
+  } catch (err) {
+    console.error("❌ Verify referral error:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ═══════════ Create Payment (PayPal Sandbox) ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
 
     if (!uid || !amount || Number(amount) < 1) {
-      return res.status(400).json({ ok: false, error: "Invalid uid or amount (min $1)" });
+      return res.status(400).json({ ok: false, error: "Invalid uid or amount (min ₹1)" });
     }
 
     const orderId = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
-
-    // Convert INR to USD (approx 1 USD = 83 INR for testing)
-    // Actually, since this is sandbox, let's keep it simple: use 1:1 for testing
-    // Or you can use a fixed rate
     const inrAmount = Number(amount);
-    const usdAmount = (inrAmount / 83).toFixed(2); // Approx conversion for testing
+    const usdAmount = (inrAmount / 83).toFixed(2);
 
     await db.collection("pending_deposits").doc(orderId).set({
       uid,
       orderId,
-      amount: inrAmount, // Store original INR amount
+      amount: inrAmount,
       usdAmount: Number(usdAmount),
       status: "PENDING",
       gateway: "paypal",
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // Get PayPal access token
     const accessToken = await getPayPalAccessToken();
 
-    // Create PayPal order
     const orderPayload = {
       intent: "CAPTURE",
       purchase_units: [{
@@ -244,11 +255,11 @@ app.post("/create-payment", async (req, res) => {
       }],
       application_context: {
         brand_name: "ArenaX",
-        landing_page: "LOGIN",
+        landing_page: "BILLING",
         shipping_preference: "NO_SHIPPING",
         user_action: "PAY_NOW",
-        return_url: "https://your-render-url.onrender.com/payment-success",
-        cancel_url: "https://your-render-url.onrender.com/payment-cancel"
+        return_url: (process.env.RETURN_URL || "https://your-render-url.onrender.com") + "/payment-success",
+        cancel_url: (process.env.RETURN_URL || "https://your-render-url.onrender.com") + "/payment-cancel"
       }
     };
 
@@ -264,13 +275,11 @@ app.post("/create-payment", async (req, res) => {
     });
 
     const paypalResult = await paypalResp.json();
-    console.log("📥 PayPal create response:", JSON.stringify(paypalResult).substring(0, 500));
 
     if (!paypalResp.ok || !paypalResult.id) {
       return res.status(500).json({ ok: false, error: "PayPal order create failed: " + JSON.stringify(paypalResult) });
     }
 
-    // Extract approval URL
     let paymentUrl = "";
     if (paypalResult.links && Array.isArray(paypalResult.links)) {
       const approveLink = paypalResult.links.find(l => l.rel === "approve" || l.rel === "payer-action");
@@ -286,8 +295,6 @@ app.post("/create-payment", async (req, res) => {
       paymentUrl: paymentUrl
     });
 
-    console.log(`✅ Payment URL: ${paymentUrl}`);
-
     res.json({
       ok: true,
       orderId,
@@ -301,7 +308,7 @@ app.post("/create-payment", async (req, res) => {
   }
 });
 
-// ═══════════ Capture PayPal Order (After user approval) ═══════════
+// ═══════════ Capture PayPal Order ═══════════
 app.post("/capture-order", async (req, res) => {
   try {
     const { orderId, paypalOrderId } = req.body;
@@ -310,7 +317,6 @@ app.post("/capture-order", async (req, res) => {
     }
 
     const accessToken = await getPayPalAccessToken();
-
     const captureResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}/capture`, {
       method: "POST",
       headers: {
@@ -318,29 +324,26 @@ app.post("/capture-order", async (req, res) => {
         "Content-Type": "application/json"
       }
     });
-
     const captureResult = await captureResp.json();
-    console.log("📥 PayPal capture response:", JSON.stringify(captureResult).substring(0, 500));
 
     if (!captureResp.ok) {
       return res.status(500).json({ ok: false, error: "PayPal capture failed: " + JSON.stringify(captureResult) });
     }
 
-    // Credit user
     const pendingSnap = await db.collection("pending_deposits").doc(orderId).get();
     if (!pendingSnap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
 
-    await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, "", "capture");
+    const captureId = captureResult.purchase_units?.[0]?.payments?.captures?.[0]?.id || "";
+    await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, captureId, "capture");
 
     res.json({ ok: true, status: "COMPLETED", captureResult });
-
   } catch (err) {
     console.error("❌ Capture order error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ Process Deposit Bonuses (Referral + First Deposit) ═══════════
+// ═══════════ Process Deposit Bonuses ═══════════
 async function processDepositBonuses(uid, depositAmount) {
   try {
     const userRef = db.collection("users").doc(uid);
@@ -350,6 +353,7 @@ async function processDepositBonuses(uid, depositAmount) {
 
     console.log(`🎁 Processing bonuses for ${uid}, deposit: ₹${depositAmount}`);
 
+    // First deposit bonus
     if (!userData.firstDepositRewarded && depositAmount >= MIN_DEPOSIT_FOR_BONUS) {
       await userRef.update({
         bonusBalance: admin.firestore.FieldValue.increment(REFERRAL_FIRST_DEPOSIT_BONUS),
@@ -370,8 +374,8 @@ async function processDepositBonuses(uid, depositAmount) {
         read: false,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
-      console.log(`✅ First deposit bonus: ₹${REFERRAL_FIRST_DEPOSIT_BONUS} to ${uid}`);
 
+      // Referrer ko bonus do
       const referrerUid = userData.referredBy;
       if (referrerUid && !userData.referralRewarded) {
         const referrerRef = db.collection("users").doc(referrerUid);
@@ -405,7 +409,7 @@ async function processDepositBonuses(uid, depositAmount) {
   }
 }
 
-// ═══════════ Credit User (Helper) ═══════════
+// ═══════════ Credit User ═══════════
 async function creditUser(pendingDoc, amount, utr, source = "webhook") {
   const pendingData = pendingDoc.data();
   const uid = pendingData.uid;
@@ -463,7 +467,7 @@ async function creditUser(pendingDoc, amount, utr, source = "webhook") {
   return { credited: true, amount, uid };
 }
 
-// ═══════════ Check Status (Polling Endpoint) ═══════════
+// ═══════════ Check Status ═══════════
 app.get("/check-status/:orderId", async (req, res) => {
   try {
     const orderId = req.params.orderId;
@@ -471,7 +475,6 @@ app.get("/check-status/:orderId", async (req, res) => {
     if (!snap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
 
     const data = snap.data();
-
     if (data.status === "COMPLETED") {
       return res.json({ ok: true, status: "COMPLETED", credited: true });
     }
@@ -481,14 +484,11 @@ app.get("/check-status/:orderId", async (req, res) => {
       return res.json({ ok: true, status: data.status, note: "No PayPal order ID yet" });
     }
 
-    // Check PayPal order status
     const accessToken = await getPayPalAccessToken();
     const statusResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}`, {
       headers: { "Authorization": `Bearer ${accessToken}` }
     });
     const statusResult = await statusResp.json();
-
-    console.log("📥 PayPal status:", statusResult.status);
 
     if (statusResult.status === "COMPLETED") {
       await creditUser(snap, Number(data.amount) || 0, "", "polling");
@@ -496,20 +496,18 @@ app.get("/check-status/:orderId", async (req, res) => {
     }
 
     res.json({ ok: true, status: statusResult.status || data.status, credited: false });
-
   } catch (err) {
     console.error("❌ Status check error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ Webhook (PayPal) ═══════════
+// ═══════════ PayPal Webhook ═══════════
 app.post("/webhook", async (req, res) => {
   const data = req.body;
-  console.log("🔔 PayPal webhook:", JSON.stringify(data, null, 2));
+  console.log("🔔 PayPal webhook:", JSON.stringify(data).substring(0, 500));
 
   try {
-    // Verify webhook signature (if webhook ID is set)
     if (PAYPAL_WEBHOOK_ID) {
       const verifyPayload = {
         auth_algo: req.headers["paypal-auth-algo"],
@@ -520,20 +518,13 @@ app.post("/webhook", async (req, res) => {
         webhook_id: PAYPAL_WEBHOOK_ID,
         webhook_event: data
       };
-
       const accessToken = await getPayPalAccessToken();
       const verifyResp = await fetch(`${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`, {
         method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Content-Type": "application/json"
-        },
+        headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
         body: JSON.stringify(verifyPayload)
       });
-
       const verifyResult = await verifyResp.json();
-      console.log("🔐 Webhook verification:", verifyResult.verification_status);
-
       if (verifyResult.verification_status !== "SUCCESS") {
         console.warn("⚠️ Webhook verification failed");
         return res.status(200).send("Verification failed");
@@ -546,19 +537,14 @@ app.post("/webhook", async (req, res) => {
     if (eventType === "PAYMENT.CAPTURE.COMPLETED") {
       const orderId = resource.custom_id || resource.invoice_id || "";
       const captureId = resource.id || "";
-      const amount = Number(resource.amount?.value || 0);
-
       if (orderId) {
         const pendingSnap = await db.collection("pending_deposits").doc(orderId).get();
         if (pendingSnap.exists) {
           await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, captureId, "webhook");
-          console.log(`✅ Webhook credited: ${orderId}`);
         }
       }
     }
-
     res.status(200).send("OK");
-
   } catch (err) {
     console.error("❌ Webhook error:", err);
     res.status(500).send("Error");
@@ -569,28 +555,17 @@ app.post("/webhook", async (req, res) => {
 app.all("/payment-success", (req, res) => {
   const orderId = req.query.orderId || "";
   const paypalOrderId = req.query.token || "";
-  
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka PayPal payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Aap is page ko band kar sakte ho. Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>
 var orderId = "${orderId}";
 var paypalOrderId = "${paypalOrderId}";
-function tryClose(){
-  window.open('','_self','');
-  window.close();
-  setTimeout(function(){ if(document.referrer) history.back(); }, 100);
-}
-// Auto-capture order on page load
+function tryClose(){window.open('','_self','');window.close();setTimeout(function(){if(document.referrer)history.back()},100);}
 if (orderId && paypalOrderId) {
-  fetch('/capture-order', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ orderId: orderId, paypalOrderId: paypalOrderId })
-  }).catch(function(e){ console.log('Capture error:', e); });
+  fetch('/capture-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ orderId: orderId, paypalOrderId: paypalOrderId }) }).catch(function(e){ console.log('Capture error:', e); });
 }
 setTimeout(tryClose, 8000);
 </script></body></html>`);
 });
 
-// ═══════════ Payment Cancel Page ═══════════
 app.all("/payment-cancel", (req, res) => {
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Cancelled</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#ff5c73;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}</style></head><body><div class="card"><div class="icon">❌</div><div class="title">Payment Cancelled</div><div class="msg">Aapne payment cancel kar diya. Koi paisa nahi kata.</div></div></body></html>`);
 });
@@ -599,5 +574,5 @@ app.all("/payment-cancel", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX Server running on port ${PORT}`);
-  console.log(`🔗 PayPal Mode: SANDBOX`);
+  console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 });
