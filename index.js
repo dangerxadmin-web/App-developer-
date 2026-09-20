@@ -1,10 +1,11 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Server — v9.0 (PayPal + Referral + Bonus + Fast)
+// ArenaX Server — v9.1 (PayPal + Referral + Bonus + Auth Bridge)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
 const admin = require("firebase-admin");
 const fetch = require("node-fetch");
+const crypto = require("crypto");   // 🆕 for one-time auth bridge tokens
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -58,6 +59,10 @@ const REFERRAL_FIRST_DEPOSIT_BONUS = 20;
 const REFERRER_BONUS = 5;
 const MIN_DEPOSIT_FOR_BONUS = 100;
 
+// 🆕 Auth Bridge Config
+const AUTH_BRIDGE_TTL_MS = 5 * 60 * 1000;   // 5 minutes validity
+const AUTH_BRIDGE_COLLECTION = "auth_bridge";
+
 console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 
 // ═══════════ PayPal Access Token ═══════════
@@ -78,12 +83,165 @@ async function getPayPalAccessToken() {
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Server", status: "running", version: "9.0.0", gateway: "paypal" });
+  res.json({ service: "ArenaX Server", status: "running", version: "9.1.0", gateway: "paypal", authBridge: true });
 });
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, ts: Date.now(), service: "arenax", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// 🔗 AUTH BRIDGE — enables external-browser sign-in on the app
+// Flow:
+//  1) Web auth page (arenax-beige.vercel.app) signs the user into
+//     Firebase (Google / Phone OTP), then calls /auth-bridge/create
+//     with the Firebase ID token to receive a one-time bridge code.
+//  2) The web page then redirects the browser to:
+//        arenax://auth-success?token=<bridgeCode>&provider=...&status=success
+//     which Android WebView hands back to the Hopweb app.
+//  3) The app calls /auth-bridge/exchange with the one-time code,
+//     receives a Firebase custom token, and calls signInWithCustomToken.
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Create one-time bridge code ───
+app.post("/auth-bridge/create", async (req, res) => {
+  try {
+    const { idToken, uid, provider } = req.body || {};
+
+    if (!idToken || !uid) {
+      return res.status(400).json({ ok: false, error: "idToken and uid are required" });
+    }
+
+    // 1️⃣ Verify the Firebase ID token from the web auth page
+    let decoded;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken, true /* checkRevoked */);
+    } catch (verifyErr) {
+      console.warn("⚠️ verifyIdToken failed:", verifyErr.message);
+      return res.status(401).json({ ok: false, error: "Invalid or expired ID token" });
+    }
+
+    // 2️⃣ Sanity check — the token must belong to the claimed UID
+    if (decoded.uid !== uid) {
+      return res.status(400).json({ ok: false, error: "UID mismatch" });
+    }
+
+    // 3️⃣ Generate a cryptographically random, single-use code
+    const code = crypto.randomBytes(32).toString("hex");
+
+    // 4️⃣ Persist the bridge document with an explicit expiry timestamp
+    await db.collection(AUTH_BRIDGE_COLLECTION).doc(code).set({
+      uid,
+      provider: provider || "google",
+      email: decoded.email || "",
+      phone: decoded.phone_number || "",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdAtMs: Date.now(),
+      expiresAtMs: Date.now() + AUTH_BRIDGE_TTL_MS,
+      used: false
+    });
+
+    console.log(`🔗 Auth bridge created: uid=${uid} provider=${provider || "google"}`);
+
+    return res.json({ ok: true, token: code, expiresIn: AUTH_BRIDGE_TTL_MS / 1000 });
+
+  } catch (err) {
+    console.error("❌ /auth-bridge/create error:", err);
+    return res.status(500).json({ ok: false, error: err.message || "create failed" });
+  }
+});
+
+// ─── Exchange one-time bridge code for a Firebase custom token ───
+app.post("/auth-bridge/exchange", async (req, res) => {
+  try {
+    const { token } = req.body || {};
+
+    if (!token || typeof token !== "string" || token.length < 20) {
+      return res.status(400).json({ ok: false, error: "token is required" });
+    }
+
+    const ref = db.collection(AUTH_BRIDGE_COLLECTION).doc(token);
+    const snap = await ref.get();
+
+    if (!snap.exists) {
+      return res.status(404).json({ ok: false, error: "Invalid or unknown token" });
+    }
+
+    const data = snap.data() || {};
+
+    // Already burned — prevent replay
+    if (data.used === true) {
+      return res.status(400).json({ ok: false, error: "Token already used" });
+    }
+
+    // Expired
+    if (typeof data.expiresAtMs === "number" && Date.now() > data.expiresAtMs) {
+      // Best-effort cleanup; ignore errors
+      ref.delete().catch(() => {});
+      return res.status(400).json({ ok: false, error: "Token expired" });
+    }
+
+    if (!data.uid) {
+      return res.status(400).json({ ok: false, error: "Bridge record missing uid" });
+    }
+
+    // 1️⃣ Burn the token immediately (atomic guard via transaction)
+    await db.runTransaction(async (tx) => {
+      const fresh = await tx.get(ref);
+      if (!fresh.exists) throw new Error("Token missing");
+      const fd = fresh.data() || {};
+      if (fd.used === true) throw new Error("Token already used");
+      if (typeof fd.expiresAtMs === "number" && Date.now() > fd.expiresAtMs) {
+        throw new Error("Token expired");
+      }
+      tx.update(ref, {
+        used: true,
+        usedAt: admin.firestore.FieldValue.serverTimestamp(),
+        usedAtMs: Date.now()
+      });
+    });
+
+    // 2️⃣ Mint a Firebase custom token for that UID
+    const customToken = await admin.auth().createCustomToken(data.uid);
+
+    console.log(`✅ Auth bridge exchanged: uid=${data.uid} provider=${data.provider || "google"}`);
+
+    return res.json({
+      ok: true,
+      customToken,
+      uid: data.uid,
+      provider: data.provider || "google"
+    });
+
+  } catch (err) {
+    console.error("❌ /auth-bridge/exchange error:", err);
+    const msg = /expired/i.test(err.message) ? "Token expired"
+              : /used/i.test(err.message)    ? "Token already used"
+              : "exchange failed";
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
+// ─── (Optional) Cleanup old auth_bridge docs — runs every 15 min ───
+async function cleanupAuthBridgeDocs() {
+  try {
+    const cutoff = Date.now() - 30 * 60 * 1000; // older than 30 min
+    const old = await db.collection(AUTH_BRIDGE_COLLECTION)
+      .where("expiresAtMs", "<", cutoff)
+      .limit(200)
+      .get();
+
+    if (old.empty) return;
+
+    const batch = db.batch();
+    old.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+    console.log(`🧹 Cleaned ${old.size} expired auth_bridge docs`);
+  } catch (err) {
+    console.warn("auth_bridge cleanup skipped:", err.message);
+  }
+}
+setInterval(cleanupAuthBridgeDocs, 15 * 60 * 1000);
 
 // ═══════════ Referral Code Generate ═══════════
 function generateReferralCode(name) {
@@ -101,7 +259,6 @@ app.post("/create-user", async (req, res) => {
       return res.status(400).json({ ok: false, error: "uid, name, email required" });
     }
 
-    // Check if user already exists
     const userRef = db.collection("users").doc(uid);
     const userSnap = await userRef.get();
     if (userSnap.exists) {
@@ -115,15 +272,15 @@ app.post("/create-user", async (req, res) => {
       .where("email", "==", normalizedEmail)
       .limit(1)
       .get();
-    
+
     if (!dupEmail.empty && dupEmail.docs[0].id !== uid) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: "This email is already registered. Please login instead." 
+      return res.status(400).json({
+        ok: false,
+        error: "This email is already registered. Please login instead."
       });
     }
 
-    // ═══ REFERRAL CODE VERIFY (agar diya) ═══
+    // ═══ REFERRAL CODE VERIFY ═══
     let referrerUid = null;
     if (referralCode) {
       const refCode = String(referralCode).trim().toUpperCase();
@@ -136,11 +293,9 @@ app.post("/create-user", async (req, res) => {
       }
     }
 
-    // Generate own referral code
     const myRefCode = generateReferralCode(name);
     const signupBonus = referrerUid ? REFERRAL_SIGNUP_BONUS : 0;
 
-    // ═══ CREATE USER DOC ═══
     await userRef.set({
       uid,
       name,
@@ -163,7 +318,6 @@ app.post("/create-user", async (req, res) => {
 
     console.log(`✅ User created: ${uid} (refCode: ${myRefCode}, referredBy: ${referrerUid || "none"}, bonus: ₹${signupBonus})`);
 
-    // ═══ SIGNUP BONUS LOG (agar referral se aaya) ═══
     if (signupBonus > 0) {
       await db.collection("wallet_transactions").add({
         uid,
@@ -195,7 +349,7 @@ app.post("/create-user", async (req, res) => {
   }
 });
 
-// ═══════════ Verify Referral Code (Optional — User Panel me use nahi hoga) ═══════════
+// ═══════════ Verify Referral Code ═══════════
 app.post("/verify-referral", async (req, res) => {
   try {
     const { code } = req.body;
@@ -217,7 +371,7 @@ app.post("/verify-referral", async (req, res) => {
   }
 });
 
-// ═══════════ Create Payment (PayPal Sandbox) ═══════════
+// ═══════════ Create Payment (PayPal) ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
@@ -353,7 +507,6 @@ async function processDepositBonuses(uid, depositAmount) {
 
     console.log(`🎁 Processing bonuses for ${uid}, deposit: ₹${depositAmount}`);
 
-    // First deposit bonus
     if (!userData.firstDepositRewarded && depositAmount >= MIN_DEPOSIT_FOR_BONUS) {
       await userRef.update({
         bonusBalance: admin.firestore.FieldValue.increment(REFERRAL_FIRST_DEPOSIT_BONUS),
@@ -375,7 +528,6 @@ async function processDepositBonuses(uid, depositAmount) {
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
 
-      // Referrer ko bonus do
       const referrerUid = userData.referredBy;
       if (referrerUid && !userData.referralRewarded) {
         const referrerRef = db.collection("users").doc(referrerUid);
@@ -575,4 +727,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX Server running on port ${PORT}`);
   console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
+  console.log(`🔗 Auth Bridge endpoints: /auth-bridge/create, /auth-bridge/exchange`);
 });
