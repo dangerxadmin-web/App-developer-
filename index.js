@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Server — v9.1 (PayPal + Referral + Bonus + Maintenance)
+// ArenaX Server — v10.0 (ZapUPI + PayPal + Referral + Bonus)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -12,7 +12,7 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-ZapUPI-Key, X-Server-IP");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
@@ -45,7 +45,13 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ Config ═══════════
+// ═══════════ ZapUPI Config ═══════════
+const ZAPUPI_API_KEY = (process.env.ZAPUPI_API_KEY || "zapf6008f46b1e765bd4a21013b796a573fe").trim();
+const ZAPUPI_API_BASE = (process.env.ZAPUPI_API_BASE || "https://api.zapupi.com").trim();
+const ZAPUPI_SERVER_IP = (process.env.ZAPUPI_SERVER_IP || "72.61.225.127").trim();
+const ZAPUPI_WEBHOOK_SECRET = (process.env.ZAPUPI_WEBHOOK_SECRET || "").trim();
+
+// ═══════════ PayPal Config (Purana — Fallback ke liye) ═══════════
 const PAYPAL_CLIENT_ID = (process.env.PAYPAL_CLIENT_ID || "").trim();
 const PAYPAL_CLIENT_SECRET = (process.env.PAYPAL_CLIENT_SECRET || "").trim();
 const PAYPAL_WEBHOOK_ID = (process.env.PAYPAL_WEBHOOK_ID || "").trim();
@@ -58,93 +64,178 @@ const REFERRAL_FIRST_DEPOSIT_BONUS = 20;
 const REFERRER_BONUS = 5;
 const MIN_DEPOSIT_FOR_BONUS = 100;
 
+console.log(`⚡ ZapUPI Mode: ${ZAPUPI_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 
-// ═══════════════════════════════════════════════════════════
-// 🛠 MAINTENANCE MODE — CACHE + MIDDLEWARE
-// ═══════════════════════════════════════════════════════════
-let maintenanceCache = {
-  active: false,
-  message: "",
-  noticeTitle: "",
-  eta: "",
-  lastChecked: 0
-};
-const MAINTENANCE_CACHE_TTL = 10000; // 10 seconds
-
-async function fetchMaintenanceStatus(force = false) {
-  const now = Date.now();
-  if (!force && (now - maintenanceCache.lastChecked) < MAINTENANCE_CACHE_TTL) {
-    return maintenanceCache;
-  }
+// ═══════════ ZapUPI: Create Payment ═══════════
+// ZapUPI ke API ko call karke order banata hai aur payment URL return karta hai.
+// NOTE: ZapUPI ka actual endpoint aapke dashboard/docs me check karna. Yahan common pattern use kiya gaya hai.
+app.post("/create-zapupi-payment", async (req, res) => {
   try {
-    const snap = await db.collection("app_config").doc("maintenance").get();
-    if (!snap.exists) {
-      maintenanceCache = { active: false, message: "", noticeTitle: "", eta: "", lastChecked: now };
-      return maintenanceCache;
+    const { uid, amount, name, email, phone, webhookUrl } = req.body;
+
+    if (!uid || !amount || Number(amount) < 1) {
+      return res.status(400).json({ ok: false, error: "Invalid uid or amount (min ₹1)" });
     }
-    const data = snap.data() || {};
-    let active = false;
-    if (data.active === true || data.enabled === true || data.maintenance === true) active = true;
-    else if (typeof data.active === "string") {
-      const s = data.active.trim().toLowerCase();
-      if (s === "true" || s === "1" || s === "yes" || s === "on") active = true;
-    }
-    maintenanceCache = {
-      active,
-      message: data.message || data.notice || "",
-      noticeTitle: data.noticeTitle || data.title || "",
-      eta: data.eta || data.backIn || "",
-      lastChecked: now
+
+    const orderId = "AXZ_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
+    const inrAmount = Number(amount);
+
+    // ═══ ZapUPI order request ═══
+    // ZapUPI ke hisaab se payload adjust karna padega. Ye common pattern hai.
+    const zapPayload = {
+      zap_key: ZAPUPI_API_KEY,
+      order_id: orderId,
+      amount: inrAmount,
+      currency: "INR",
+      customer_name: name || "Player",
+      customer_email: email || "user@arenax.app",
+      customer_phone: phone || "9999999999",
+      redirect_url: (process.env.RETURN_URL || "https://arenax-webhook.onrender.com") + "/zapupi-success?orderId=" + orderId,
+      webhook_url: webhookUrl || (process.env.RETURN_URL || "https://arenax-webhook.onrender.com") + "/zapupi-webhook",
+      remarks: `ArenaX Wallet Topup — ₹${inrAmount}`
     };
-    return maintenanceCache;
-  } catch (err) {
-    console.warn("⚠️ Maintenance fetch failed:", err.message);
-    return maintenanceCache;
-  }
-}
 
-// Maintenance blocking middleware — ye routes maintenance ke dauran block honge
-const MAINTENANCE_BLOCKED_ROUTES = [
-  "/create-payment",
-  "/capture-order",
-  "/create-user",
-  "/verify-referral"
-];
+    console.log("📤 ZapUPI create order:", JSON.stringify(zapPayload));
 
-app.use(async (req, res, next) => {
-  // Skip blocked check for these paths
-  if (
-    req.path === "/" ||
-    req.path === "/health" ||
-    req.path === "/maintenance-status" ||
-    req.path.startsWith("/check-status/") ||
-    req.path.startsWith("/webhook") ||
-    req.path.startsWith("/payment-success") ||
-    req.path.startsWith("/payment-cancel")
-  ) {
-    return next();
-  }
+    const zapResp = await fetch(`${ZAPUPI_API_BASE}/api/create-order`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-ZapUPI-Key": ZAPUPI_API_KEY,
+        "X-Server-IP": ZAPUPI_SERVER_IP
+      },
+      body: JSON.stringify(zapPayload)
+    });
 
-  // Block matching routes when maintenance ON
-  const shouldBlock = MAINTENANCE_BLOCKED_ROUTES.some(r => req.path.startsWith(r));
-  if (shouldBlock) {
-    const m = await fetchMaintenanceStatus();
-    if (m.active) {
-      console.log(`🛠 Blocked ${req.path} — maintenance ON`);
-      return res.status(503).json({
+    const zapResult = await zapResp.json();
+    console.log("📥 ZapUPI response:", JSON.stringify(zapResult));
+
+    // ZapUPI response ke hisaab se fields adjust karo
+    // Common fields: status, payment_url, order_id, qr_code, upi_link
+    let paymentUrl = "";
+    if (zapResult.payment_url) paymentUrl = zapResult.payment_url;
+    else if (zapResult.paymentUrl) paymentUrl = zapResult.paymentUrl;
+    else if (zapResult.url) paymentUrl = zapResult.url;
+    else if (zapResult.data && zapResult.data.payment_url) paymentUrl = zapResult.data.payment_url;
+    else if (zapResult.data && zapResult.data.paymentUrl) paymentUrl = zapResult.data.paymentUrl;
+
+    if (!zapResp.ok || !paymentUrl) {
+      return res.status(500).json({
         ok: false,
-        error: "MAINTENANCE",
-        message: m.message || "App is under maintenance. Please try again later.",
-        noticeTitle: m.noticeTitle || "Maintenance",
-        eta: m.eta || ""
+        error: "ZapUPI order create failed: " + JSON.stringify(zapResult)
       });
     }
+
+    await db.collection("pending_deposits").doc(orderId).set({
+      uid,
+      orderId,
+      amount: inrAmount,
+      status: "PENDING",
+      gateway: "zapupi",
+      zapupiOrderId: zapResult.order_id || zapResult.orderId || orderId,
+      paymentUrl: paymentUrl,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      ok: true,
+      orderId,
+      paymentUrl: paymentUrl,
+      gateway: "zapupi"
+    });
+
+  } catch (err) {
+    console.error("❌ ZapUPI create payment error:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
-  next();
 });
 
-// ═══════════ PayPal Access Token ═══════════
+// ═══════════ ZapUPI: Webhook ═══════════
+// ZapUPI payment success hone par yahan notification bhejta hai.
+// Yahan signature verify karna chahiye agar ZapUPI deta hai.
+app.post("/zapupi-webhook", async (req, res) => {
+  const data = req.body;
+  console.log("🔔 ZapUPI webhook received:", JSON.stringify(data).substring(0, 500));
+
+  try {
+    // Optional: signature verify
+    if (ZAPUPI_WEBHOOK_SECRET) {
+      const sig = req.headers["x-zapupi-signature"] || req.headers["x-signature"] || "";
+      // Yahan apna signature verification logic daalo
+      // if (!verifyZapUPISignature(sig, JSON.stringify(data), ZAPUPI_WEBHOOK_SECRET)) {
+      //   console.warn("⚠️ ZapUPI webhook signature failed");
+      //   return res.status(200).send("Invalid signature");
+      // }
+    }
+
+    // ZapUPI ke webhook payload se order_id aur status nikalna
+    // Common fields: order_id, status, amount, transaction_id, utr
+    const orderId =
+      data.order_id ||
+      data.orderId ||
+      (data.data && data.data.order_id) ||
+      (data.data && data.data.orderId) ||
+      "";
+
+    const status =
+      (data.status || (data.data && data.data.status) || "").toUpperCase();
+
+    const txnId =
+      data.transaction_id ||
+      data.txn_id ||
+      data.utr ||
+      (data.data && data.data.transaction_id) ||
+      (data.data && data.data.utr) ||
+      "";
+
+    console.log(`📋 ZapUPI webhook: orderId=${orderId}, status=${status}, txn=${txnId}`);
+
+    if (!orderId) {
+      console.warn("⚠️ No orderId in ZapUPI webhook");
+      return res.status(200).send("No orderId");
+    }
+
+    // Success statuses (ZapUPI ke hisaab se check karo)
+    const successStatuses = ["SUCCESS", "COMPLETED", "PAID", "CAPTURED", "SUCCESSFUL"];
+    if (successStatuses.includes(status)) {
+      const pendingRef = db.collection("pending_deposits").doc(orderId);
+      const pendingSnap = await pendingRef.get();
+      if (pendingSnap.exists) {
+        await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, txnId, "zapupi-webhook");
+        console.log(`✅ ZapUPI webhook credited: ${orderId}`);
+      } else {
+        console.warn(`⚠️ Pending deposit not found: ${orderId}`);
+      }
+    } else {
+      console.log(`ℹ️ ZapUPI webhook status not success: ${status}`);
+    }
+
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("❌ ZapUPI webhook error:", err);
+    res.status(500).send("Error");
+  }
+});
+
+// ═══════════ ZapUPI: Success Page ═══════════
+app.all("/zapupi-success", (req, res) => {
+  const orderId = req.query.orderId || "";
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>
+var orderId = "${orderId}";
+function tryClose(){window.open('','_self','');window.close();setTimeout(function(){if(document.referrer)history.back()},100);}
+if (orderId) {
+  fetch('/check-status/' + orderId).catch(function(e){ console.log('Status check error:', e); });
+}
+setTimeout(tryClose, 8000);
+</script></body></html>`);
+});
+
+app.all("/zapupi-cancel", (req, res) => {
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Cancelled</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#ff5c73;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}</style></head><body><div class="card"><div class="icon">❌</div><div class="title">Payment Cancelled</div><div class="msg">Aapne payment cancel kar diya. Koi paisa nahi kata.</div></div></body></html>`);
+});
+
+// ═══════════ PayPal Access Token (Fallback) ═══════════
 async function getPayPalAccessToken() {
   const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
   const resp = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
@@ -162,29 +253,11 @@ async function getPayPalAccessToken() {
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Server", status: "running", version: "9.1.0", gateway: "paypal" });
+  res.json({ service: "ArenaX Server", status: "running", version: "10.0.0", gateway: "zapupi+paypal" });
 });
 
 app.get("/health", (req, res) => {
   res.json({ ok: true, ts: Date.now(), service: "arenax", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
-});
-
-// ═══════════ 🆕 Maintenance Status Endpoint ═══════════
-app.get("/maintenance-status", async (req, res) => {
-  try {
-    const force = req.query.force === "1" || req.query.force === "true";
-    const m = await fetchMaintenanceStatus(force);
-    res.json({
-      ok: true,
-      active: m.active,
-      message: m.message,
-      noticeTitle: m.noticeTitle,
-      eta: m.eta
-    });
-  } catch (err) {
-    console.error("❌ Maintenance status error:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
 });
 
 // ═══════════ Referral Code Generate ═══════════
@@ -215,11 +288,11 @@ app.post("/create-user", async (req, res) => {
       .where("email", "==", normalizedEmail)
       .limit(1)
       .get();
-    
+
     if (!dupEmail.empty && dupEmail.docs[0].id !== uid) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: "This email is already registered. Please login instead." 
+      return res.status(400).json({
+        ok: false,
+        error: "This email is already registered. Please login instead."
       });
     }
 
@@ -313,7 +386,7 @@ app.post("/verify-referral", async (req, res) => {
   }
 });
 
-// ═══════════ Create Payment (PayPal) ═══════════
+// ═══════════ Create Payment (PayPal — Purana Fallback) ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
@@ -358,8 +431,6 @@ app.post("/create-payment", async (req, res) => {
         cancel_url: (process.env.RETURN_URL || "https://your-render-url.onrender.com") + "/payment-cancel"
       }
     };
-
-    console.log("📤 PayPal create order:", JSON.stringify(orderPayload));
 
     const paypalResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
       method: "POST",
@@ -540,7 +611,7 @@ async function creditUser(pendingDoc, amount, utr, source = "webhook") {
       description: `Deposit — ${pendingData.orderId || ""}`,
       orderId: pendingData.orderId || "",
       utr: utr || "",
-      source: "paypal",
+      source: pendingData.gateway || "unknown",
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
@@ -573,30 +644,53 @@ app.get("/check-status/:orderId", async (req, res) => {
       return res.json({ ok: true, status: "COMPLETED", credited: true });
     }
 
+    // Agar ZapUPI order hai to ZapUPI se status pucho
+    if (data.gateway === "zapupi" && data.zapupiOrderId) {
+      try {
+        const zapResp = await fetch(`${ZAPUPI_API_BASE}/api/order-status?order_id=${data.zapupiOrderId}`, {
+          headers: {
+            "X-ZapUPI-Key": ZAPUPI_API_KEY,
+            "X-Server-IP": ZAPUPI_SERVER_IP
+          }
+        });
+        const zapResult = await zapResp.json();
+        const status = (zapResult.status || (zapResult.data && zapResult.data.status) || "").toUpperCase();
+        const successStatuses = ["SUCCESS", "COMPLETED", "PAID", "CAPTURED", "SUCCESSFUL"];
+        if (successStatuses.includes(status)) {
+          const txnId = zapResult.transaction_id || zapResult.utr || (zapResult.data && zapResult.data.transaction_id) || "";
+          await creditUser(snap, Number(data.amount) || 0, txnId, "zapupi-polling");
+          return res.json({ ok: true, status: "COMPLETED", credited: true });
+        }
+        return res.json({ ok: true, status: status || data.status, credited: false });
+      } catch (e) {
+        console.warn("ZapUPI status check failed:", e.message);
+      }
+    }
+
+    // PayPal fallback
     const paypalOrderId = data.paypalOrderId;
-    if (!paypalOrderId) {
-      return res.json({ ok: true, status: data.status, note: "No PayPal order ID yet" });
+    if (paypalOrderId && PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET) {
+      const accessToken = await getPayPalAccessToken();
+      const statusResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}`, {
+        headers: { "Authorization": `Bearer ${accessToken}` }
+      });
+      const statusResult = await statusResp.json();
+
+      if (statusResult.status === "COMPLETED") {
+        await creditUser(snap, Number(data.amount) || 0, "", "paypal-polling");
+        return res.json({ ok: true, status: "COMPLETED", credited: true });
+      }
+      return res.json({ ok: true, status: statusResult.status || data.status, credited: false });
     }
 
-    const accessToken = await getPayPalAccessToken();
-    const statusResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}`, {
-      headers: { "Authorization": `Bearer ${accessToken}` }
-    });
-    const statusResult = await statusResp.json();
-
-    if (statusResult.status === "COMPLETED") {
-      await creditUser(snap, Number(data.amount) || 0, "", "polling");
-      return res.json({ ok: true, status: "COMPLETED", credited: true });
-    }
-
-    res.json({ ok: true, status: statusResult.status || data.status, credited: false });
+    res.json({ ok: true, status: data.status, credited: false });
   } catch (err) {
     console.error("❌ Status check error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ PayPal Webhook ═══════════
+// ═══════════ PayPal Webhook (Purana Fallback) ═══════════
 app.post("/webhook", async (req, res) => {
   const data = req.body;
   console.log("🔔 PayPal webhook:", JSON.stringify(data).substring(0, 500));
@@ -634,7 +728,7 @@ app.post("/webhook", async (req, res) => {
       if (orderId) {
         const pendingSnap = await db.collection("pending_deposits").doc(orderId).get();
         if (pendingSnap.exists) {
-          await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, captureId, "webhook");
+          await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, captureId, "paypal-webhook");
         }
       }
     }
@@ -645,7 +739,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ═══════════ Payment Success Page ═══════════
+// ═══════════ PayPal Success Page (Purana) ═══════════
 app.all("/payment-success", (req, res) => {
   const orderId = req.query.orderId || "";
   const paypalOrderId = req.query.token || "";
@@ -668,6 +762,6 @@ app.all("/payment-cancel", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX Server running on port ${PORT}`);
+  console.log(`⚡ ZapUPI Mode: ${ZAPUPI_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
   console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
-  console.log(`🛠 Maintenance support enabled`);
 });
