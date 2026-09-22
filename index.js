@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// ArenaX Server — v10.0 (ZapUPI + PayPal + Referral + Bonus)
+// ArenaX Server — v11.0 (ZapUPI + PayPal + Referral + Bonus)
 // ═══════════════════════════════════════════════════════════
 
 const express = require("express");
@@ -45,31 +45,27 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ ZapUPI Config ═══════════
+// ═══════════ ZapUPI Config (Actual API) ═══════════
 const ZAPUPI_API_KEY = (process.env.ZAPUPI_API_KEY || "zapf6008f46b1e765bd4a21013b796a573fe").trim();
-const ZAPUPI_API_BASE = (process.env.ZAPUPI_API_BASE || "https://api.zapupi.com").trim();
+const ZAPUPI_API_BASE = (process.env.ZAPUPI_API_BASE || "https://pay.zapupi.com").trim();
 const ZAPUPI_SERVER_IP = (process.env.ZAPUPI_SERVER_IP || "72.61.225.127").trim();
-const ZAPUPI_WEBHOOK_SECRET = (process.env.ZAPUPI_WEBHOOK_SECRET || "").trim();
 
-// ═══════════ PayPal Config (Purana — Fallback ke liye) ═══════════
+// ═══════════ PayPal Config (Fallback) ═══════════
 const PAYPAL_CLIENT_ID = (process.env.PAYPAL_CLIENT_ID || "").trim();
 const PAYPAL_CLIENT_SECRET = (process.env.PAYPAL_CLIENT_SECRET || "").trim();
 const PAYPAL_WEBHOOK_ID = (process.env.PAYPAL_WEBHOOK_ID || "").trim();
 const PAYPAL_API_BASE = process.env.PAYPAL_API_BASE || "https://api-m.sandbox.paypal.com";
 const PAYPAL_CURRENCY = "USD";
 
-// Referral & Bonus Config
 const REFERRAL_SIGNUP_BONUS = 5;
 const REFERRAL_FIRST_DEPOSIT_BONUS = 20;
 const REFERRER_BONUS = 5;
 const MIN_DEPOSIT_FOR_BONUS = 100;
 
-console.log(`⚡ ZapUPI Mode: ${ZAPUPI_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
+console.log(`⚡ ZapUPI API Base: ${ZAPUPI_API_BASE}`);
 console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 
-// ═══════════ ZapUPI: Create Payment ═══════════
-// ZapUPI ke API ko call karke order banata hai aur payment URL return karta hai.
-// NOTE: ZapUPI ka actual endpoint aapke dashboard/docs me check karna. Yahan common pattern use kiya gaya hai.
+// ═══════════ ZapUPI: Create Order ═══════════
 app.post("/create-zapupi-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone, webhookUrl } = req.body;
@@ -80,20 +76,19 @@ app.post("/create-zapupi-payment", async (req, res) => {
 
     const orderId = "AXZ_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
     const inrAmount = Number(amount);
+    const returnBase = process.env.RETURN_URL || "https://arenax-webhook.onrender.com";
 
-    // ═══ ZapUPI order request ═══
-    // ZapUPI ke hisaab se payload adjust karna padega. Ye common pattern hai.
+    // ZapUPI ke actual request body format ke hisaab se
     const zapPayload = {
       zap_key: ZAPUPI_API_KEY,
       order_id: orderId,
       amount: inrAmount,
-      currency: "INR",
-      customer_name: name || "Player",
-      customer_email: email || "user@arenax.app",
-      customer_phone: phone || "9999999999",
-      redirect_url: (process.env.RETURN_URL || "https://arenax-webhook.onrender.com") + "/zapupi-success?orderId=" + orderId,
-      webhook_url: webhookUrl || (process.env.RETURN_URL || "https://arenax-webhook.onrender.com") + "/zapupi-webhook",
-      remarks: `ArenaX Wallet Topup — ₹${inrAmount}`
+      customer_mobile: phone || "9999999999",
+      remark: `ArenaX Wallet Topup - Rs.${inrAmount}`,
+      success_url: `${returnBase}/zapupi-success?orderId=${orderId}`,
+      failed_url: `${returnBase}/zapupi-cancel`,
+      timeout_url: `${returnBase}/zapupi-cancel`,
+      webhook_url: webhookUrl || `${returnBase}/zapupi-webhook`
     };
 
     console.log("📤 ZapUPI create order:", JSON.stringify(zapPayload));
@@ -111,16 +106,8 @@ app.post("/create-zapupi-payment", async (req, res) => {
     const zapResult = await zapResp.json();
     console.log("📥 ZapUPI response:", JSON.stringify(zapResult));
 
-    // ZapUPI response ke hisaab se fields adjust karo
-    // Common fields: status, payment_url, order_id, qr_code, upi_link
-    let paymentUrl = "";
-    if (zapResult.payment_url) paymentUrl = zapResult.payment_url;
-    else if (zapResult.paymentUrl) paymentUrl = zapResult.paymentUrl;
-    else if (zapResult.url) paymentUrl = zapResult.url;
-    else if (zapResult.data && zapResult.data.payment_url) paymentUrl = zapResult.data.payment_url;
-    else if (zapResult.data && zapResult.data.paymentUrl) paymentUrl = zapResult.data.paymentUrl;
-
-    if (!zapResp.ok || !paymentUrl) {
+    // ZapUPI actual response: { status: "success", message: "...", order_id: "8333", environment: "cashier", txn_id: "ZAPUPI...", payment_url: "https://pay.zapupi.com/..." }
+    if (!zapResp.ok || zapResult.status !== "success" || !zapResult.payment_url) {
       return res.status(500).json({
         ok: false,
         error: "ZapUPI order create failed: " + JSON.stringify(zapResult)
@@ -133,15 +120,16 @@ app.post("/create-zapupi-payment", async (req, res) => {
       amount: inrAmount,
       status: "PENDING",
       gateway: "zapupi",
-      zapupiOrderId: zapResult.order_id || zapResult.orderId || orderId,
-      paymentUrl: paymentUrl,
+      zapupiOrderId: zapResult.order_id || orderId,
+      zapupiTxnId: zapResult.txn_id || "",
+      paymentUrl: zapResult.payment_url,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     res.json({
       ok: true,
       orderId,
-      paymentUrl: paymentUrl,
+      paymentUrl: zapResult.payment_url,
       gateway: "zapupi"
     });
 
@@ -152,40 +140,26 @@ app.post("/create-zapupi-payment", async (req, res) => {
 });
 
 // ═══════════ ZapUPI: Webhook ═══════════
-// ZapUPI payment success hone par yahan notification bhejta hai.
-// Yahan signature verify karna chahiye agar ZapUPI deta hai.
 app.post("/zapupi-webhook", async (req, res) => {
   const data = req.body;
   console.log("🔔 ZapUPI webhook received:", JSON.stringify(data).substring(0, 500));
 
   try {
-    // Optional: signature verify
-    if (ZAPUPI_WEBHOOK_SECRET) {
-      const sig = req.headers["x-zapupi-signature"] || req.headers["x-signature"] || "";
-      // Yahan apna signature verification logic daalo
-      // if (!verifyZapUPISignature(sig, JSON.stringify(data), ZAPUPI_WEBHOOK_SECRET)) {
-      //   console.warn("⚠️ ZapUPI webhook signature failed");
-      //   return res.status(200).send("Invalid signature");
-      // }
-    }
-
-    // ZapUPI ke webhook payload se order_id aur status nikalna
-    // Common fields: order_id, status, amount, transaction_id, utr
+    // ZapUPI webhook payload se order_id aur status nikalna
+    // Common fields: order_id, status, txn_id, utr, amount
     const orderId =
       data.order_id ||
       data.orderId ||
       (data.data && data.data.order_id) ||
-      (data.data && data.data.orderId) ||
       "";
 
-    const status =
-      (data.status || (data.data && data.data.status) || "").toUpperCase();
+    const status = (data.status || (data.data && data.data.status) || "").toLowerCase();
 
     const txnId =
-      data.transaction_id ||
       data.txn_id ||
+      data.transaction_id ||
       data.utr ||
-      (data.data && data.data.transaction_id) ||
+      (data.data && data.data.txn_id) ||
       (data.data && data.data.utr) ||
       "";
 
@@ -196,8 +170,8 @@ app.post("/zapupi-webhook", async (req, res) => {
       return res.status(200).send("No orderId");
     }
 
-    // Success statuses (ZapUPI ke hisaab se check karo)
-    const successStatuses = ["SUCCESS", "COMPLETED", "PAID", "CAPTURED", "SUCCESSFUL"];
+    // ZapUPI success statuses
+    const successStatuses = ["success", "completed", "paid", "captured", "successful"];
     if (successStatuses.includes(status)) {
       const pendingRef = db.collection("pending_deposits").doc(orderId);
       const pendingSnap = await pendingRef.get();
@@ -253,7 +227,7 @@ async function getPayPalAccessToken() {
 
 // ═══════════ Root & Health ═══════════
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Server", status: "running", version: "10.0.0", gateway: "zapupi+paypal" });
+  res.json({ service: "ArenaX Server", status: "running", version: "11.0.0", gateway: "zapupi+paypal" });
 });
 
 app.get("/health", (req, res) => {
@@ -386,7 +360,7 @@ app.post("/verify-referral", async (req, res) => {
   }
 });
 
-// ═══════════ Create Payment (PayPal — Purana Fallback) ═══════════
+// ═══════════ Create Payment (PayPal — Fallback) ═══════════
 app.post("/create-payment", async (req, res) => {
   try {
     const { uid, amount, name, email, phone } = req.body;
@@ -644,24 +618,35 @@ app.get("/check-status/:orderId", async (req, res) => {
       return res.json({ ok: true, status: "COMPLETED", credited: true });
     }
 
-    // Agar ZapUPI order hai to ZapUPI se status pucho
-    if (data.gateway === "zapupi" && data.zapupiOrderId) {
+    // ZapUPI order status check
+    if (data.gateway === "zapupi") {
       try {
-        const zapResp = await fetch(`${ZAPUPI_API_BASE}/api/order-status?order_id=${data.zapupiOrderId}`, {
+        const zapResp = await fetch(`${ZAPUPI_API_BASE}/api/order-status`, {
+          method: "POST",
           headers: {
+            "Content-Type": "application/json",
             "X-ZapUPI-Key": ZAPUPI_API_KEY,
             "X-Server-IP": ZAPUPI_SERVER_IP
-          }
+          },
+          body: JSON.stringify({
+            zap_key: ZAPUPI_API_KEY,
+            order_id: data.zapupiOrderId || orderId
+          })
         });
         const zapResult = await zapResp.json();
-        const status = (zapResult.status || (zapResult.data && zapResult.data.status) || "").toUpperCase();
-        const successStatuses = ["SUCCESS", "COMPLETED", "PAID", "CAPTURED", "SUCCESSFUL"];
-        if (successStatuses.includes(status)) {
-          const txnId = zapResult.transaction_id || zapResult.utr || (zapResult.data && zapResult.data.transaction_id) || "";
-          await creditUser(snap, Number(data.amount) || 0, txnId, "zapupi-polling");
-          return res.json({ ok: true, status: "COMPLETED", credited: true });
+        console.log("📥 ZapUPI status response:", JSON.stringify(zapResult));
+
+        // ZapUPI response: { status: "success", message: "...", data: { order_id, status: "Pending|Success|Failed", txn_id, utr, amount, ... } }
+        if (zapResult.status === "success" && zapResult.data) {
+          const txnStatus = (zapResult.data.status || "").toLowerCase();
+          const successStatuses = ["success", "completed", "paid", "captured", "successful"];
+          if (successStatuses.includes(txnStatus)) {
+            const txnId = zapResult.data.txn_id || zapResult.data.utr || "";
+            await creditUser(snap, Number(data.amount) || 0, txnId, "zapupi-polling");
+            return res.json({ ok: true, status: "COMPLETED", credited: true });
+          }
+          return res.json({ ok: true, status: zapResult.data.status || data.status, credited: false });
         }
-        return res.json({ ok: true, status: status || data.status, credited: false });
       } catch (e) {
         console.warn("ZapUPI status check failed:", e.message);
       }
@@ -690,7 +675,7 @@ app.get("/check-status/:orderId", async (req, res) => {
   }
 });
 
-// ═══════════ PayPal Webhook (Purana Fallback) ═══════════
+// ═══════════ PayPal Webhook (Fallback) ═══════════
 app.post("/webhook", async (req, res) => {
   const data = req.body;
   console.log("🔔 PayPal webhook:", JSON.stringify(data).substring(0, 500));
@@ -739,7 +724,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ═══════════ PayPal Success Page (Purana) ═══════════
+// ═══════════ PayPal Success Page (Fallback) ═══════════
 app.all("/payment-success", (req, res) => {
   const orderId = req.query.orderId || "";
   const paypalOrderId = req.query.token || "";
@@ -762,6 +747,6 @@ app.all("/payment-cancel", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 ArenaX Server running on port ${PORT}`);
-  console.log(`⚡ ZapUPI Mode: ${ZAPUPI_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
+  console.log(`⚡ ZapUPI API Base: ${ZAPUPI_API_BASE}`);
   console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
 });
