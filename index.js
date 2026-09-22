@@ -46,7 +46,7 @@ try {
 const db = admin.firestore();
 
 // ═══════════ ZapUPI Config (Actual API) ═══════════
-const ZAPUPI_API_KEY = (process.env.ZAPUPI_API_KEY || "zapf6008f46b1e765bd4a21013b796a573fe").trim();
+const ZAPUPI_API_KEY = (process.env.ZAPUPI_API_KEY || "zapf6008f46b1e765bd4a21013b796a573f").trim();
 const ZAPUPI_API_BASE = (process.env.ZAPUPI_API_BASE || "https://pay.zapupi.com").trim();
 const ZAPUPI_SERVER_IP = (process.env.ZAPUPI_SERVER_IP || "72.61.225.127").trim();
 
