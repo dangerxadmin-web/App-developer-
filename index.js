@@ -1,30 +1,32 @@
-// ═══════════════════════════════════════════════════════════
-// ArenaX Server — v11.0 (ZapUPI + PayPal + Referral + Bonus)
-// ═══════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════
+   ArenaX Payment Gateway Server — v12.0
+   Custom UPI Payment Gateway (ZapUPI-style, own gateway)
+   ═══════════════════════════════════════════════════════════ */
 
 const express = require("express");
 const admin = require("firebase-admin");
 const fetch = require("node-fetch");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static("public"));
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "Content-Type, X-ZapUPI-Key, X-Server-IP");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
-// ═══════════ Firebase Init ═══════════
+/* ═══════════ Firebase Init ═══════════ */
 let serviceAccount;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
     const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf-8");
     serviceAccount = JSON.parse(decoded);
-    console.log("✅ Firebase SA loaded from BASE64");
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   } else if (process.env.NODE_ENV !== "production") {
@@ -45,708 +47,573 @@ try {
 
 const db = admin.firestore();
 
-// ═══════════ ZapUPI Config (Actual API) ═══════════
-const ZAPUPI_API_KEY = (process.env.ZAPUPI_API_KEY || "zapf6008f46b1e765bd4a21013b796a573f").trim();
-const ZAPUPI_API_BASE = (process.env.ZAPUPI_API_BASE || "https://pay.zapupi.com").trim();
-const ZAPUPI_SERVER_IP = (process.env.ZAPUPI_SERVER_IP || "72.61.225.127").trim();
-
-// ═══════════ PayPal Config (Fallback) ═══════════
-const PAYPAL_CLIENT_ID = (process.env.PAYPAL_CLIENT_ID || "").trim();
-const PAYPAL_CLIENT_SECRET = (process.env.PAYPAL_CLIENT_SECRET || "").trim();
-const PAYPAL_WEBHOOK_ID = (process.env.PAYPAL_WEBHOOK_ID || "").trim();
-const PAYPAL_API_BASE = process.env.PAYPAL_API_BASE || "https://api-m.sandbox.paypal.com";
-const PAYPAL_CURRENCY = "USD";
-
-const REFERRAL_SIGNUP_BONUS = 5;
-const REFERRAL_FIRST_DEPOSIT_BONUS = 20;
+/* ═══════════ Config ═══════════ */
+const PORT = process.env.PORT || 3000;
+const MERCHANT_UPI = process.env.MERCHANT_UPI || "yourupi@ybl";
+const MERCHANT_NAME = process.env.MERCHANT_NAME || "ArenaX Esports";
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || "change-this-secret-key";
+const MIN_DEPOSIT = 10;
+const MIN_WITHDRAW = 50;
+const SIGNUP_BONUS = 5;
 const REFERRER_BONUS = 5;
+const FIRST_DEPOSIT_BONUS = 20;
 const MIN_DEPOSIT_FOR_BONUS = 100;
 
-console.log(`⚡ ZapUPI API Base: ${ZAPUPI_API_BASE}`);
-console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
-
-// ═══════════ ZapUPI: Create Order ═══════════
-app.post("/create-zapupi-payment", async (req, res) => {
-  try {
-    const { uid, amount, name, email, phone, webhookUrl } = req.body;
-
-    if (!uid || !amount || Number(amount) < 1) {
-      return res.status(400).json({ ok: false, error: "Invalid uid or amount (min ₹1)" });
-    }
-
-    const orderId = "AXZ_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
-    const inrAmount = Number(amount);
-    const returnBase = process.env.RETURN_URL || "https://arenax-webhook.onrender.com";
-
-    // ZapUPI ke actual request body format ke hisaab se
-    const zapPayload = {
-      zap_key: ZAPUPI_API_KEY,
-      order_id: orderId,
-      amount: inrAmount,
-      customer_mobile: phone || "9999999999",
-      remark: `ArenaX Wallet Topup - Rs.${inrAmount}`,
-      success_url: `${returnBase}/zapupi-success?orderId=${orderId}`,
-      failed_url: `${returnBase}/zapupi-cancel`,
-      timeout_url: `${returnBase}/zapupi-cancel`,
-      webhook_url: webhookUrl || `${returnBase}/zapupi-webhook`
-    };
-
-    console.log("📤 ZapUPI create order:", JSON.stringify(zapPayload));
-
-    const zapResp = await fetch(`${ZAPUPI_API_BASE}/api/create-order`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-ZapUPI-Key": ZAPUPI_API_KEY,
-        "X-Server-IP": ZAPUPI_SERVER_IP
-      },
-      body: JSON.stringify(zapPayload)
-    });
-
-    const zapResult = await zapResp.json();
-    console.log("📥 ZapUPI response:", JSON.stringify(zapResult));
-
-    // ZapUPI actual response: { status: "success", message: "...", order_id: "8333", environment: "cashier", txn_id: "ZAPUPI...", payment_url: "https://pay.zapupi.com/..." }
-    if (!zapResp.ok || zapResult.status !== "success" || !zapResult.payment_url) {
-      return res.status(500).json({
-        ok: false,
-        error: "ZapUPI order create failed: " + JSON.stringify(zapResult)
-      });
-    }
-
-    await db.collection("pending_deposits").doc(orderId).set({
-      uid,
-      orderId,
-      amount: inrAmount,
-      status: "PENDING",
-      gateway: "zapupi",
-      zapupiOrderId: zapResult.order_id || orderId,
-      zapupiTxnId: zapResult.txn_id || "",
-      paymentUrl: zapResult.payment_url,
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    res.json({
-      ok: true,
-      orderId,
-      paymentUrl: zapResult.payment_url,
-      gateway: "zapupi"
-    });
-
-  } catch (err) {
-    console.error("❌ ZapUPI create payment error:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════ ZapUPI: Webhook ═══════════
-app.post("/zapupi-webhook", async (req, res) => {
-  const data = req.body;
-  console.log("🔔 ZapUPI webhook received:", JSON.stringify(data).substring(0, 500));
-
-  try {
-    // ZapUPI webhook payload se order_id aur status nikalna
-    // Common fields: order_id, status, txn_id, utr, amount
-    const orderId =
-      data.order_id ||
-      data.orderId ||
-      (data.data && data.data.order_id) ||
-      "";
-
-    const status = (data.status || (data.data && data.data.status) || "").toLowerCase();
-
-    const txnId =
-      data.txn_id ||
-      data.transaction_id ||
-      data.utr ||
-      (data.data && data.data.txn_id) ||
-      (data.data && data.data.utr) ||
-      "";
-
-    console.log(`📋 ZapUPI webhook: orderId=${orderId}, status=${status}, txn=${txnId}`);
-
-    if (!orderId) {
-      console.warn("⚠️ No orderId in ZapUPI webhook");
-      return res.status(200).send("No orderId");
-    }
-
-    // ZapUPI success statuses
-    const successStatuses = ["success", "completed", "paid", "captured", "successful"];
-    if (successStatuses.includes(status)) {
-      const pendingRef = db.collection("pending_deposits").doc(orderId);
-      const pendingSnap = await pendingRef.get();
-      if (pendingSnap.exists) {
-        await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, txnId, "zapupi-webhook");
-        console.log(`✅ ZapUPI webhook credited: ${orderId}`);
-      } else {
-        console.warn(`⚠️ Pending deposit not found: ${orderId}`);
-      }
-    } else {
-      console.log(`ℹ️ ZapUPI webhook status not success: ${status}`);
-    }
-
-    res.status(200).send("OK");
-  } catch (err) {
-    console.error("❌ ZapUPI webhook error:", err);
-    res.status(500).send("Error");
-  }
-});
-
-// ═══════════ ZapUPI: Success Page ═══════════
-app.all("/zapupi-success", (req, res) => {
-  const orderId = req.query.orderId || "";
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>
-var orderId = "${orderId}";
-function tryClose(){window.open('','_self','');window.close();setTimeout(function(){if(document.referrer)history.back()},100);}
-if (orderId) {
-  fetch('/check-status/' + orderId).catch(function(e){ console.log('Status check error:', e); });
-}
-setTimeout(tryClose, 8000);
-</script></body></html>`);
-});
-
-app.all("/zapupi-cancel", (req, res) => {
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Cancelled</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#ff5c73;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}</style></head><body><div class="card"><div class="icon">❌</div><div class="title">Payment Cancelled</div><div class="msg">Aapne payment cancel kar diya. Koi paisa nahi kata.</div></div></body></html>`);
-});
-
-// ═══════════ PayPal Access Token (Fallback) ═══════════
-async function getPayPalAccessToken() {
-  const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
-  const resp = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: "grant_type=client_credentials"
-  });
-  const data = await resp.json();
-  if (!data.access_token) throw new Error("PayPal access token failed: " + JSON.stringify(data));
-  return data.access_token;
-}
-
-// ═══════════ Root & Health ═══════════
+/* ═══════════ Health & Root ═══════════ */
 app.get("/", (req, res) => {
-  res.json({ service: "ArenaX Server", status: "running", version: "11.0.0", gateway: "zapupi+paypal" });
+  res.json({
+    service: "ArenaX Payment Gateway",
+    status: "running",
+    version: "12.0.0",
+    gateway: "custom-upi"
+  });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, ts: Date.now(), service: "arenax", firebase: admin.apps.length > 0 ? "connected" : "disconnected" });
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    service: "arenax-payment",
+    firebase: admin.apps.length > 0 ? "connected" : "disconnected"
+  });
 });
 
-// ═══════════ Referral Code Generate ═══════════
-function generateReferralCode(name) {
-  const clean = (name || "PLAYER").toUpperCase().replace(/[^A-Z0-9]/g, "").substring(0, 8) || "PLAYER";
-  const num = Math.floor(100 + Math.random() * 900);
-  return clean + num;
-}
-
-// ═══════════ Create User (Signup with Referral) ═══════════
-app.post("/create-user", async (req, res) => {
+/* ═══════════════════════════════════════════════════════════
+   AUTH — Register User (signup bonus + referral)
+═══════════════════════════════════════════════════════════ */
+app.post("/api/auth/register", async (req, res) => {
   try {
-    const { uid, name, email, phone, referralCode } = req.body;
-
+    const { uid, name, email, referralCode } = req.body;
     if (!uid || !name || !email) {
       return res.status(400).json({ ok: false, error: "uid, name, email required" });
     }
 
     const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-    if (userSnap.exists) {
+    const existing = await userRef.get();
+    if (existing.exists) {
       return res.json({ ok: true, alreadyExists: true });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
-
-    const dupEmail = await db.collection("users")
-      .where("email", "==", normalizedEmail)
-      .limit(1)
-      .get();
-
-    if (!dupEmail.empty && dupEmail.docs[0].id !== uid) {
-      return res.status(400).json({
-        ok: false,
-        error: "This email is already registered. Please login instead."
-      });
-    }
-
+    // Referral validation
     let referrerUid = null;
     if (referralCode) {
-      const refCode = String(referralCode).trim().toUpperCase();
-      const q = await db.collection("users").where("referralCode", "==", refCode).limit(1).get();
-      if (!q.empty) {
-        referrerUid = q.docs[0].id;
-        console.log(`🎁 Referral detected: ${refCode} → ${referrerUid}`);
-      } else {
-        console.log(`⚠️ Invalid referral code: ${refCode} (skipped)`);
-      }
+      const q = await db.collection("users").where("referralCode", "==", String(referralCode).toUpperCase()).limit(1).get();
+      if (!q.empty) referrerUid = q.docs[0].id;
     }
 
-    const myRefCode = generateReferralCode(name);
-    const signupBonus = referrerUid ? REFERRAL_SIGNUP_BONUS : 0;
+    const myRefCode = (String(name).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8) || "PLAYER") +
+      Math.floor(100 + Math.random() * 900);
+
+    const bonus = referrerUid ? SIGNUP_BONUS : 0;
 
     await userRef.set({
-      uid,
-      name,
-      email: normalizedEmail,
-      phone: phone || "",
-      photoURL: "",
+      uid, name, email, phone: "",
       balance: 0,
-      bonusBalance: signupBonus,
-      gameUid: "",
-      ign: "",
-      matchesPlayed: 0,
-      totalWon: 0,
-      banned: false,
+      bonusBalance: bonus,
       referralCode: myRefCode,
       referredBy: referrerUid || "",
       referralRewarded: false,
       firstDepositRewarded: false,
+      matchesPlayed: 0,
+      totalWon: 0,
+      banned: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`✅ User created: ${uid} (refCode: ${myRefCode}, referredBy: ${referrerUid || "none"}, bonus: ₹${signupBonus})`);
-
-    if (signupBonus > 0) {
+    if (bonus > 0) {
       await db.collection("wallet_transactions").add({
-        uid,
-        amount: signupBonus,
-        type: "credit",
-        isBonus: true,
-        description: "🎁 Sign-up Referral Bonus",
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-      await db.collection("notifications").add({
-        uid,
-        title: "🎁 Welcome Bonus!",
-        body: `₹${signupBonus} sign-up bonus mila! Tournament join karne me use kar sakte ho.`,
-        read: false,
+        uid, amount: bonus, type: "credit", isBonus: true,
+        description: "🎁 Sign-up Bonus",
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
     }
 
-    res.json({
-      ok: true,
-      referralCode: myRefCode,
-      signupBonus,
-      referredBy: referrerUid || ""
-    });
-
+    res.json({ ok: true, referralCode: myRefCode, signupBonus: bonus, referredBy: referrerUid || "" });
   } catch (err) {
-    console.error("❌ Create user error:", err);
+    console.error("register error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ Verify Referral Code ═══════════
-app.post("/verify-referral", async (req, res) => {
+/* ═══════════════════════════════════════════════════════════
+   AUTH — Login (verifies Firebase token)
+═══════════════════════════════════════════════════════════ */
+app.post("/api/auth/login", async (req, res) => {
   try {
-    const { code } = req.body;
-    if (!code) return res.status(400).json({ ok: false, error: "Code required" });
-    const refCode = String(code).trim().toUpperCase();
-    const q = await db.collection("users").where("referralCode", "==", refCode).limit(1).get();
-    if (q.empty) return res.json({ ok: false, valid: false, error: "Invalid referral code" });
-    const referrerDoc = q.docs[0];
-    const referrerData = referrerDoc.data();
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ ok: false, error: "idToken required" });
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const userDoc = await db.collection("users").doc(decoded.uid).get();
     res.json({
       ok: true,
-      valid: true,
-      referrerUid: referrerDoc.id,
-      referrerName: referrerData.name || "Player"
+      uid: decoded.uid,
+      email: decoded.email,
+      profile: userDoc.exists ? userDoc.data() : null
     });
   } catch (err) {
-    console.error("❌ Verify referral error:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(401).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ Create Payment (PayPal — Fallback) ═══════════
-app.post("/create-payment", async (req, res) => {
+/* ═══════════════════════════════════════════════════════════
+   PROFILE — Update
+═══════════════════════════════════════════════════════════ */
+app.post("/api/user/update-profile", async (req, res) => {
   try {
-    const { uid, amount, name, email, phone } = req.body;
+    const { uid, name, gameUid, ign } = req.body;
+    if (!uid) return res.status(400).json({ ok: false, error: "uid required" });
 
-    if (!uid || !amount || Number(amount) < 1) {
-      return res.status(400).json({ ok: false, error: "Invalid uid or amount (min ₹1)" });
-    }
-
-    const orderId = "AX_" + Date.now() + "_" + Math.random().toString(36).substring(2, 8).toUpperCase();
-    const inrAmount = Number(amount);
-    const usdAmount = (inrAmount / 83).toFixed(2);
-
-    await db.collection("pending_deposits").doc(orderId).set({
-      uid,
-      orderId,
-      amount: inrAmount,
-      usdAmount: Number(usdAmount),
-      status: "PENDING",
-      gateway: "paypal",
-      createdAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    const accessToken = await getPayPalAccessToken();
-
-    const orderPayload = {
-      intent: "CAPTURE",
-      purchase_units: [{
-        amount: {
-          currency_code: PAYPAL_CURRENCY,
-          value: usdAmount
-        },
-        description: `ArenaX Wallet Topup — ₹${inrAmount}`,
-        custom_id: orderId,
-        invoice_id: orderId
-      }],
-      application_context: {
-        brand_name: "ArenaX",
-        landing_page: "BILLING",
-        shipping_preference: "NO_SHIPPING",
-        user_action: "PAY_NOW",
-        return_url: (process.env.RETURN_URL || "https://your-render-url.onrender.com") + "/payment-success",
-        cancel_url: (process.env.RETURN_URL || "https://your-render-url.onrender.com") + "/payment-cancel"
+    const update = {};
+    if (name) update.name = String(name).trim().slice(0, 24);
+    if (gameUid !== undefined) {
+      if (gameUid && !/^[0-9]{6,15}$/.test(gameUid)) {
+        return res.status(400).json({ ok: false, error: "Invalid game UID" });
       }
-    };
-
-    const paypalResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(orderPayload)
-    });
-
-    const paypalResult = await paypalResp.json();
-
-    if (!paypalResp.ok || !paypalResult.id) {
-      return res.status(500).json({ ok: false, error: "PayPal order create failed: " + JSON.stringify(paypalResult) });
+      update.gameUid = gameUid || "";
     }
+    if (ign !== undefined) update.ign = String(ign || "").trim().slice(0, 24);
+    update.updatedAt = admin.firestore.FieldValue.serverTimestamp();
 
-    let paymentUrl = "";
-    if (paypalResult.links && Array.isArray(paypalResult.links)) {
-      const approveLink = paypalResult.links.find(l => l.rel === "approve" || l.rel === "payer-action");
-      if (approveLink) paymentUrl = approveLink.href;
-    }
-
-    if (!paymentUrl) {
-      return res.status(500).json({ ok: false, error: "PayPal approval URL not found" });
-    }
-
-    await db.collection("pending_deposits").doc(orderId).update({
-      paypalOrderId: paypalResult.id,
-      paymentUrl: paymentUrl
-    });
-
-    res.json({
-      ok: true,
-      orderId,
-      paypalOrderId: paypalResult.id,
-      paymentUrl: paymentUrl
-    });
-
+    await db.collection("users").doc(uid).set(update, { merge: true });
+    res.json({ ok: true });
   } catch (err) {
-    console.error("❌ Create payment error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ Capture PayPal Order ═══════════
-app.post("/capture-order", async (req, res) => {
+/* ═══════════════════════════════════════════════════════════
+   MATCHES — List
+═══════════════════════════════════════════════════════════ */
+app.get("/api/matches", async (req, res) => {
   try {
-    const { orderId, paypalOrderId } = req.body;
-    if (!orderId || !paypalOrderId) {
-      return res.status(400).json({ ok: false, error: "orderId and paypalOrderId required" });
-    }
-
-    const accessToken = await getPayPalAccessToken();
-    const captureResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}/capture`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
-      }
-    });
-    const captureResult = await captureResp.json();
-
-    if (!captureResp.ok) {
-      return res.status(500).json({ ok: false, error: "PayPal capture failed: " + JSON.stringify(captureResult) });
-    }
-
-    const pendingSnap = await db.collection("pending_deposits").doc(orderId).get();
-    if (!pendingSnap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
-
-    const captureId = captureResult.purchase_units?.[0]?.payments?.captures?.[0]?.id || "";
-    await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, captureId, "capture");
-
-    res.json({ ok: true, status: "COMPLETED", captureResult });
+    const { game, mode, team } = req.query;
+    let q = db.collection("tournaments");
+    if (game) q = q.where("game", "==", game);
+    const snap = await q.get();
+    let items = [];
+    snap.forEach(d => items.push({ id: d.id, ...d.data() }));
+    if (mode) items = items.filter(t => String(t.mode || t.category || "").toLowerCase() === mode.toLowerCase());
+    if (team) items = items.filter(t => String(t.teamSize || t.team || "").toLowerCase() === team.toLowerCase());
+    items = items.filter(t => t.status !== "CANCELLED");
+    items.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+    res.json({ ok: true, matches: items });
   } catch (err) {
-    console.error("❌ Capture order error:", err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ═══════════ Process Deposit Bonuses ═══════════
-async function processDepositBonuses(uid, depositAmount) {
+/* ═══════════════════════════════════════════════════════════
+   MATCHES — Join
+═══════════════════════════════════════════════════════════ */
+app.post("/api/matches/join", async (req, res) => {
   try {
+    const { uid, matchId, gameUID, ign } = req.body;
+    if (!uid || !matchId || !gameUID || !ign) {
+      return res.status(400).json({ ok: false, error: "uid, matchId, gameUID, ign required" });
+    }
+
     const userRef = db.collection("users").doc(uid);
-    const userSnap = await userRef.get();
-    if (!userSnap.exists) return;
-    const userData = userSnap.data();
+    const matchRef = db.collection("tournaments").doc(matchId);
 
-    console.log(`🎁 Processing bonuses for ${uid}, deposit: ₹${depositAmount}`);
+    let result = null;
 
-    if (!userData.firstDepositRewarded && depositAmount >= MIN_DEPOSIT_FOR_BONUS) {
-      await userRef.update({
-        bonusBalance: admin.firestore.FieldValue.increment(REFERRAL_FIRST_DEPOSIT_BONUS),
-        firstDepositRewarded: true
+    await db.runTransaction(async (tx) => {
+      const userSnap = await tx.get(userRef);
+      const matchSnap = await tx.get(matchRef);
+
+      if (!userSnap.exists) throw new Error("User not found");
+      if (!matchSnap.exists) throw new Error("Match not found");
+
+      const u = userSnap.data();
+      const m = matchSnap.data();
+
+      if (u.banned === true) throw new Error("Account banned");
+      if (m.status === "CANCELLED") throw new Error("Match cancelled");
+      if (m.status === "COMPLETED" || m.completed === true) throw new Error("Match completed");
+      if (m.status === "STARTED" || m.started === true) throw new Error("Match started");
+
+      const balance = Number(u.balance || u.realBalance || u.mainBalance || 0);
+      const bonus = Number(u.bonusBalance || u.bonus || 0);
+      const total = balance + bonus;
+      const fee = Number(m.entryFee || 0);
+      const joined = Number(m.joinedCount || 0);
+      const max = Number(m.maxSlots || 100);
+      const joinedUsers = Array.isArray(m.joinedUsers) ? m.joinedUsers : [];
+
+      if (joinedUsers.includes(uid)) throw new Error("Already joined");
+      if (joined >= max) throw new Error("Match is full");
+      if (total < fee) throw new Error("Insufficient balance");
+
+      let newBonus = bonus, newBalance = balance;
+      if (bonus >= fee) newBonus = bonus - fee;
+      else { newBonus = 0; newBalance = balance - (fee - bonus); }
+
+      tx.update(userRef, {
+        balance: newBalance,
+        bonusBalance: newBonus,
+        ign, gameUid: gameUID,
+        matchesPlayed: admin.firestore.FieldValue.increment(1)
       });
+      tx.update(matchRef, {
+        joinedCount: admin.firestore.FieldValue.increment(1),
+        joinedUsers: [...joinedUsers, uid]
+      });
+      tx.set(matchRef.collection("participants").doc(uid), {
+        uid, ign, gameUid: gameUID, entryFeePaid: fee,
+        joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+        name: u.name || "Player"
+      });
+
+      result = { fee, newBalance, newBonus };
+    });
+
+    if (result.fee > 0) {
       await db.collection("wallet_transactions").add({
-        uid,
-        amount: REFERRAL_FIRST_DEPOSIT_BONUS,
-        type: "credit",
-        isBonus: true,
-        description: `🎁 First Deposit Bonus (₹${MIN_DEPOSIT_FOR_BONUS}+)`,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
+        uid, amount: -result.fee, type: "debit",
+        description: `Entry Fee — Match ${matchId}`,
+        matchId, createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
-      await db.collection("notifications").add({
-        uid,
-        title: "🎁 First Deposit Bonus",
-        body: `₹${REFERRAL_FIRST_DEPOSIT_BONUS} bonus mila! Tournament join karne me use kar sakte ho.`,
-        read: false,
-        createdAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-
-      const referrerUid = userData.referredBy;
-      if (referrerUid && !userData.referralRewarded) {
-        const referrerRef = db.collection("users").doc(referrerUid);
-        const referrerSnap = await referrerRef.get();
-        if (referrerSnap.exists) {
-          await referrerRef.update({
-            bonusBalance: admin.firestore.FieldValue.increment(REFERRER_BONUS)
-          });
-          await db.collection("wallet_transactions").add({
-            uid: referrerUid,
-            amount: REFERRER_BONUS,
-            type: "credit",
-            isBonus: true,
-            description: `🎁 Referral Bonus — ${userData.name || "Friend"}`,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-          await db.collection("notifications").add({
-            uid: referrerUid,
-            title: "🎁 Referral Bonus",
-            body: `${userData.name || "Aapke friend"} ne ₹${MIN_DEPOSIT_FOR_BONUS} deposit kiya! ₹${REFERRER_BONUS} bonus mila.`,
-            read: false,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-          await userRef.update({ referralRewarded: true });
-          console.log(`✅ Referrer bonus: ₹${REFERRER_BONUS} to ${referrerUid}`);
-        }
-      }
     }
+
+    res.json({ ok: true, message: "Joined successfully", ...result });
   } catch (err) {
-    console.error("❌ processDepositBonuses error:", err);
+    res.status(400).json({ ok: false, error: err.message });
   }
-}
+});
 
-// ═══════════ Credit User ═══════════
-async function creditUser(pendingDoc, amount, utr, source = "webhook") {
-  const pendingData = pendingDoc.data();
-  const uid = pendingData.uid;
-  if (!uid) throw new Error("No uid in pending deposit");
+/* ═══════════════════════════════════════════════════════════
+   WALLET — Create Order (Custom UPI Gateway)
+═══════════════════════════════════════════════════════════ */
+app.post("/api/wallet/createOrder", async (req, res) => {
+  try {
+    const { userId, amount, gateway } = req.body;
+    if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
+    const amt = Number(amount);
+    if (!amt || amt < MIN_DEPOSIT) {
+      return res.status(400).json({ ok: false, error: `Minimum deposit ₹${MIN_DEPOSIT}` });
+    }
 
-  if (pendingData.status === "COMPLETED") {
-    console.log("✅ Already processed:", pendingData.orderId);
-    return { credited: false, alreadyProcessed: true };
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) return res.status(404).json({ ok: false, error: "User not found" });
+    if (userDoc.data().banned === true) return res.status(403).json({ ok: false, error: "Account banned" });
+
+    // Generate unique order ID
+    const orderId = "AX_" + Date.now() + "_" + crypto.randomBytes(3).toString("hex").toUpperCase();
+
+    // Build UPI deep-link URI
+    const payeeName = encodeURIComponent(MERCHANT_NAME);
+    const txnNote = encodeURIComponent("ArenaX Topup " + orderId);
+    const upiUri = `upi://pay?pa=${MERCHANT_UPI}&pn=${payeeName}&am=${amt}&cu=INR&tn=${txnNote}&tr=${orderId}`;
+
+    // Store pending order
+    await db.collection("pending_deposits").doc(orderId).set({
+      uid: userId,
+      orderId,
+      amount: amt,
+      currency: "INR",
+      gateway: gateway || "UPI",
+      merchant_upi: MERCHANT_UPI,
+      payee_name: MERCHANT_NAME,
+      upi_uri: upiUri,
+      status: "PENDING",
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      ok: true,
+      orderId,
+      amount: amt,
+      currency: "INR",
+      gateway: gateway || "UPI",
+      merchant_upi: MERCHANT_UPI,
+      payee_name: MERCHANT_NAME,
+      upi_uri: upiUri,
+      status: "PENDING",
+      payment_page: `${process.env.PUBLIC_BASE_URL || "https://arenax-webhook.onrender.com"}/pay/${orderId}`
+    });
+  } catch (err) {
+    console.error("createOrder error:", err);
+    res.status(500).json({ ok: false, error: err.message });
   }
+});
 
-  const userRef = db.collection("users").doc(uid);
+/* ═══════════════════════════════════════════════════════════
+   WALLET — Submit UTR / Verify Payment
+═══════════════════════════════════════════════════════════ */
+app.post("/api/wallet/submit-utr", async (req, res) => {
+  try {
+    const { orderId, utr } = req.body;
+    if (!orderId) return res.status(400).json({ ok: false, error: "orderId required" });
+    if (!utr || !/^\d{12}$/.test(String(utr))) {
+      return res.status(400).json({ ok: false, error: "UTR must be 12 digits" });
+    }
+
+    const pendingRef = db.collection("pending_deposits").doc(orderId);
+    const snap = await pendingRef.get();
+    if (!snap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
+
+    const data = snap.data();
+    if (data.status === "COMPLETED") {
+      return res.json({ ok: true, status: "COMPLETED", message: "Already verified" });
+    }
+
+    await pendingRef.update({
+      utr: String(utr),
+      status: "PENDING",
+      utrSubmittedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      ok: true,
+      status: "PENDING",
+      message: "UTR submitted. Awaiting verification.",
+      orderId, utr
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════
+   WALLET — Status Check
+═══════════════════════════════════════════════════════════ */
+app.get("/api/wallet/status/:orderId", async (req, res) => {
+  try {
+    const snap = await db.collection("pending_deposits").doc(req.params.orderId).get();
+    if (!snap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
+    const d = snap.data();
+    res.json({
+      ok: true,
+      orderId: d.orderId,
+      amount: d.amount,
+      status: d.status,
+      utr: d.utr || "",
+      upi_uri: d.upi_uri,
+      merchant_upi: d.merchant_upi,
+      payee_name: d.payee_name
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════
+   WALLET — Withdraw
+═══════════════════════════════════════════════════════════ */
+app.post("/api/wallet/withdraw", async (req, res) => {
+  try {
+    const { userId, amount, upi } = req.body;
+    if (!userId || !amount || !upi) {
+      return res.status(400).json({ ok: false, error: "userId, amount, upi required" });
+    }
+    const amt = Number(amount);
+    if (amt < MIN_WITHDRAW) return res.status(400).json({ ok: false, error: `Min ₹${MIN_WITHDRAW}` });
+    if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) {
+      return res.status(400).json({ ok: false, error: "Invalid UPI ID" });
+    }
+
+    const userRef = db.collection("users").doc(userId);
+    let result = null;
+
+    await db.runTransaction(async (tx) => {
+      const userSnap = await tx.get(userRef);
+      if (!userSnap.exists) throw new Error("User not found");
+      const u = userSnap.data();
+      if (u.banned === true) throw new Error("Account banned");
+      if (Number(u.matchesPlayed || 0) < 3) throw new Error("Play at least 3 matches first");
+      const bal = Number(u.balance || u.realBalance || u.mainBalance || 0);
+      if (bal < amt) throw new Error("Insufficient balance");
+      tx.update(userRef, { balance: bal - amt });
+      result = { newBalance: bal - amt };
+    });
+
+    await db.collection("withdrawals").add({
+      uid: userId, amount: amt, upi,
+      status: "PENDING",
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await db.collection("wallet_transactions").add({
+      uid: userId, amount: -amt, type: "debit",
+      description: `Withdrawal → ${upi}`,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ ok: true, message: "Withdrawal requested", ...result });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════
+   ADMIN — Verify Deposit (UTR match)
+═══════════════════════════════════════════════════════════ */
+app.post("/api/admin/verify-deposit", async (req, res) => {
+  try {
+    const { adminKey, orderId } = req.body;
+    if (adminKey !== ADMIN_API_KEY) return res.status(403).json({ ok: false, error: "Invalid admin key" });
+    if (!orderId) return res.status(400).json({ ok: false, error: "orderId required" });
+
+    const result = await creditUser(orderId, "admin");
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════
+   INTERNAL — Credit user wallet
+═══════════════════════════════════════════════════════════ */
+async function creditUser(orderId, source) {
+  const pendingRef = db.collection("pending_deposits").doc(orderId);
+  const snap = await pendingRef.get();
+  if (!snap.exists) throw new Error("Order not found");
+
+  const data = snap.data();
+  if (data.status === "COMPLETED") return { credited: false, alreadyDone: true };
+
+  const userRef = db.collection("users").doc(data.uid);
+  let result = null;
 
   await db.runTransaction(async (tx) => {
     const userSnap = await tx.get(userRef);
     if (!userSnap.exists) throw new Error("User not found");
-    if (userSnap.data().banned === true) throw new Error("User banned");
+    const u = userSnap.data();
 
-    const currentBal = Number(userSnap.data().balance || 0);
-    tx.update(userRef, { balance: currentBal + amount });
-
-    tx.update(pendingDoc.ref, {
+    const newBalance = Number(u.balance || u.realBalance || u.mainBalance || 0) + Number(data.amount);
+    tx.update(userRef, { balance: newBalance });
+    tx.update(pendingRef, {
       status: "COMPLETED",
-      utr: utr || "",
-      creditedAmount: amount,
-      source,
-      completedAt: admin.firestore.FieldValue.serverTimestamp()
+      creditedAt: admin.firestore.FieldValue.serverTimestamp(),
+      source
     });
 
     const txRef = db.collection("wallet_transactions").doc();
     tx.set(txRef, {
-      uid,
-      amount,
+      uid: data.uid,
+      amount: Number(data.amount),
       type: "credit",
-      description: `Deposit — ${pendingData.orderId || ""}`,
-      orderId: pendingData.orderId || "",
-      utr: utr || "",
-      source: pendingData.gateway || "unknown",
+      description: `Deposit — ${orderId}`,
+      orderId,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
     const notifRef = db.collection("notifications").doc();
     tx.set(notifRef, {
-      uid,
+      uid: data.uid,
       title: "✅ Deposit Credited",
-      body: `₹${amount} added to your wallet!`,
+      body: `₹${data.amount} added to your wallet!`,
       read: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
+
+    result = { credited: true, amount: data.amount, uid: data.uid };
   });
 
-  console.log(`✅ Credited ₹${amount} to ${uid} (via ${source})`);
+  // First deposit bonus
+  try {
+    await processDepositBonuses(data.uid, Number(data.amount));
+  } catch (e) { console.warn("Bonus processing failed:", e.message); }
 
-  await processDepositBonuses(uid, amount);
-
-  return { credited: true, amount, uid };
+  return result;
 }
 
-// ═══════════ Check Status ═══════════
-app.get("/check-status/:orderId", async (req, res) => {
-  try {
-    const orderId = req.params.orderId;
-    const snap = await db.collection("pending_deposits").doc(orderId).get();
-    if (!snap.exists) return res.status(404).json({ ok: false, error: "Order not found" });
+async function processDepositBonuses(uid, amount) {
+  const userRef = db.collection("users").doc(uid);
+  const snap = await userRef.get();
+  if (!snap.exists) return;
+  const u = snap.data();
 
-    const data = snap.data();
-    if (data.status === "COMPLETED") {
-      return res.json({ ok: true, status: "COMPLETED", credited: true });
-    }
+  if (!u.firstDepositRewarded && amount >= MIN_DEPOSIT_FOR_BONUS) {
+    await userRef.update({
+      bonusBalance: admin.firestore.FieldValue.increment(FIRST_DEPOSIT_BONUS),
+      firstDepositRewarded: true
+    });
+    await db.collection("wallet_transactions").add({
+      uid, amount: FIRST_DEPOSIT_BONUS, type: "credit", isBonus: true,
+      description: "🎁 First Deposit Bonus",
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-    // ZapUPI order status check
-    if (data.gateway === "zapupi") {
-      try {
-        const zapResp = await fetch(`${ZAPUPI_API_BASE}/api/order-status`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-ZapUPI-Key": ZAPUPI_API_KEY,
-            "X-Server-IP": ZAPUPI_SERVER_IP
-          },
-          body: JSON.stringify({
-            zap_key: ZAPUPI_API_KEY,
-            order_id: data.zapupiOrderId || orderId
-          })
-        });
-        const zapResult = await zapResp.json();
-        console.log("📥 ZapUPI status response:", JSON.stringify(zapResult));
-
-        // ZapUPI response: { status: "success", message: "...", data: { order_id, status: "Pending|Success|Failed", txn_id, utr, amount, ... } }
-        if (zapResult.status === "success" && zapResult.data) {
-          const txnStatus = (zapResult.data.status || "").toLowerCase();
-          const successStatuses = ["success", "completed", "paid", "captured", "successful"];
-          if (successStatuses.includes(txnStatus)) {
-            const txnId = zapResult.data.txn_id || zapResult.data.utr || "";
-            await creditUser(snap, Number(data.amount) || 0, txnId, "zapupi-polling");
-            return res.json({ ok: true, status: "COMPLETED", credited: true });
-          }
-          return res.json({ ok: true, status: zapResult.data.status || data.status, credited: false });
-        }
-      } catch (e) {
-        console.warn("ZapUPI status check failed:", e.message);
-      }
-    }
-
-    // PayPal fallback
-    const paypalOrderId = data.paypalOrderId;
-    if (paypalOrderId && PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET) {
-      const accessToken = await getPayPalAccessToken();
-      const statusResp = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${paypalOrderId}`, {
-        headers: { "Authorization": `Bearer ${accessToken}` }
+    // Referrer bonus
+    const referrerUid = u.referredBy;
+    if (referrerUid && !u.referralRewarded) {
+      await db.collection("users").doc(referrerUid).update({
+        bonusBalance: admin.firestore.FieldValue.increment(REFERRER_BONUS)
       });
-      const statusResult = await statusResp.json();
-
-      if (statusResult.status === "COMPLETED") {
-        await creditUser(snap, Number(data.amount) || 0, "", "paypal-polling");
-        return res.json({ ok: true, status: "COMPLETED", credited: true });
-      }
-      return res.json({ ok: true, status: statusResult.status || data.status, credited: false });
-    }
-
-    res.json({ ok: true, status: data.status, credited: false });
-  } catch (err) {
-    console.error("❌ Status check error:", err);
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// ═══════════ PayPal Webhook (Fallback) ═══════════
-app.post("/webhook", async (req, res) => {
-  const data = req.body;
-  console.log("🔔 PayPal webhook:", JSON.stringify(data).substring(0, 500));
-
-  try {
-    if (PAYPAL_WEBHOOK_ID) {
-      const verifyPayload = {
-        auth_algo: req.headers["paypal-auth-algo"],
-        cert_url: req.headers["paypal-cert-url"],
-        transmission_id: req.headers["paypal-transmission-id"],
-        transmission_sig: req.headers["paypal-transmission-sig"],
-        transmission_time: req.headers["paypal-transmission-time"],
-        webhook_id: PAYPAL_WEBHOOK_ID,
-        webhook_event: data
-      };
-      const accessToken = await getPayPalAccessToken();
-      const verifyResp = await fetch(`${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`, {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" },
-        body: JSON.stringify(verifyPayload)
+      await db.collection("wallet_transactions").add({
+        uid: referrerUid, amount: REFERRER_BONUS, type: "credit", isBonus: true,
+        description: `🎁 Referral Bonus — ${u.name || "Friend"}`,
+        createdAt: admin.firestore.FieldValue.serverTimestamp()
       });
-      const verifyResult = await verifyResp.json();
-      if (verifyResult.verification_status !== "SUCCESS") {
-        console.warn("⚠️ Webhook verification failed");
-        return res.status(200).send("Verification failed");
-      }
+      await userRef.update({ referralRewarded: true });
     }
-
-    const eventType = data.event_type;
-    const resource = data.resource || {};
-
-    if (eventType === "PAYMENT.CAPTURE.COMPLETED") {
-      const orderId = resource.custom_id || resource.invoice_id || "";
-      const captureId = resource.id || "";
-      if (orderId) {
-        const pendingSnap = await db.collection("pending_deposits").doc(orderId).get();
-        if (pendingSnap.exists) {
-          await creditUser(pendingSnap, Number(pendingSnap.data().amount) || 0, captureId, "paypal-webhook");
-        }
-      }
-    }
-    res.status(200).send("OK");
-  } catch (err) {
-    console.error("❌ Webhook error:", err);
-    res.status(500).send("Error");
   }
-});
-
-// ═══════════ PayPal Success Page (Fallback) ═══════════
-app.all("/payment-success", (req, res) => {
-  const orderId = req.query.orderId || "";
-  const paypalOrderId = req.query.token || "";
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Successful</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#00e676;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}.hint{margin-top:20px;padding:14px;background:rgba(0,229,255,.08);border:1px solid rgba(0,229,255,.3);border-radius:12px;font-size:13px;color:#00e5ff}.close-btn{width:100%;padding:14px;margin-top:20px;background:linear-gradient(135deg,#00e5ff,#7c4dff);color:#04121a;border:none;border-radius:12px;font-size:15px;font-weight:800;cursor:pointer}</style></head><body><div class="card"><div class="icon">✅</div><div class="title">Payment Successful!</div><div class="msg">Aapka payment ho gaya hai. Balance 5-10 second me add ho jayega.</div><div class="hint">Wapas app kholke balance dekho.</div><button class="close-btn" onclick="tryClose()">CLOSE PAGE</button></div><script>
-var orderId = "${orderId}";
-var paypalOrderId = "${paypalOrderId}";
-function tryClose(){window.open('','_self','');window.close();setTimeout(function(){if(document.referrer)history.back()},100);}
-if (orderId && paypalOrderId) {
-  fetch('/capture-order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ orderId: orderId, paypalOrderId: paypalOrderId }) }).catch(function(e){ console.log('Capture error:', e); });
 }
-setTimeout(tryClose, 8000);
-</script></body></html>`);
+
+/* ═══════════════════════════════════════════════════════════
+   PAYMENT PAGE (simple UPI page with QR)
+═══════════════════════════════════════════════════════════ */
+app.get("/pay/:orderId", async (req, res) => {
+  const orderId = req.params.orderId;
+  const snap = await db.collection("pending_deposits").doc(orderId).get();
+  if (!snap.exists) return res.status(404).send("Order not found");
+
+  const o = snap.data();
+  res.send(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Pay ₹${o.amount} — ArenaX</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+body{margin:0;background:#0f172a;color:#f1f5f9;font-family:sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{background:#1e293b;border:1px solid #334155;border-radius:20px;padding:24px;max-width:400px;width:100%;text-align:center}
+h1{margin:0 0 8px;font-size:20px;color:#22c55e}
+.amt{font-size:40px;font-weight:900;color:#22c55e;margin:12px 0}
+#qrcode{background:#fff;padding:16px;border-radius:12px;display:inline-block;margin:16px 0}
+.upi{background:#0f172a;padding:12px;border-radius:10px;font-family:monospace;font-size:13px;color:#06b6d4;word-break:break-all;margin:12px 0}
+.btn{display:block;width:100%;padding:14px;background:linear-gradient(135deg,#06b6d4,#7c4dff);border:none;color:#fff;font-weight:800;border-radius:12px;margin-top:10px;cursor:pointer;font-size:15px;text-decoration:none;text-align:center;box-sizing:border-box}
+input{width:100%;padding:14px;border-radius:10px;background:#0f172a;border:1px solid #334155;color:#f1f5f9;font-size:15px;margin-top:12px;box-sizing:border-box;outline:none}
+.status{padding:12px;border-radius:10px;margin-top:12px;font-size:13px}
+.status.ok{background:rgba(34,197,94,.15);color:#22c55e;border:1px solid rgba(34,197,94,.4)}
+.status.wait{background:rgba(245,158,11,.15);color:#f59e0b;border:1px solid rgba(245,158,11,.4)}
+.status.err{background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.4)}
+</style></head>
+<body>
+<div class="card">
+  <h1>🏆 ArenaX Topup</h1>
+  <div class="amt">₹${o.amount}</div>
+  <p style="color:#94a3b8;font-size:13px;margin:0">Order: ${o.orderId}</p>
+  <div id="qrcode"></div>
+  <div class="upi">${o.merchant_upi}</div>
+  <a class="btn" href="${o.upi_uri}">📱 Open UPI App</a>
+  <input type="text" id="utr" placeholder="Enter 12-digit UTR" maxlength="12" inputmode="numeric">
+  <button class="btn" onclick="verify()">✅ Verify Payment</button>
+  <div id="status"></div>
+</div>
+<script>
+new QRCode(document.getElementById("qrcode"), { text: "${o.upi_uri}", width: 200, height: 200 });
+async function verify() {
+  const utr = document.getElementById("utr").value.trim();
+  const s = document.getElementById("status");
+  if (!/^\\d{12}$/.test(utr)) { s.className = "status err"; s.textContent = "❌ UTR must be 12 digits"; return; }
+  s.className = "status wait"; s.textContent = "⏳ Verifying...";
+  try {
+    const r = await fetch("/api/wallet/submit-utr", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ orderId: "${o.orderId}", utr })
+    });
+    const d = await r.json();
+    if (d.status === "PENDING") { s.className = "status wait"; s.textContent = "⏳ UTR submitted. Awaiting verification."; }
+    else if (d.status === "COMPLETED") { s.className = "status ok"; s.textContent = "✅ Verified!"; }
+    else { s.className = "status err"; s.textContent = "❌ " + (d.error || "Failed"); }
+  } catch(e) { s.className = "status err"; s.textContent = "❌ Network error"; }
+}
+</script>
+</body></html>`);
 });
 
-app.all("/payment-cancel", (req, res) => {
-  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Payment Cancelled</title><style>body{min-height:100vh;background:#05070d;color:#eef2ff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;padding:24px;text-align:center;margin:0}.card{max-width:400px;width:100%;background:linear-gradient(160deg,#10162a,#0a0e1a);border:1px solid #1f2a4a;border-radius:22px;padding:36px 24px}.icon{font-size:72px}.title{font-size:22px;font-weight:800;color:#ff5c73;margin:18px 0 12px}.msg{color:#8892b0;line-height:1.6}</style></head><body><div class="card"><div class="icon">❌</div><div class="title">Payment Cancelled</div><div class="msg">Aapne payment cancel kar diya. Koi paisa nahi kata.</div></div></body></html>`);
-});
-
-// ═══════════ Start ═══════════
-const PORT = process.env.PORT || 3000;
+/* ═══════════ Start ═══════════ */
 app.listen(PORT, () => {
-  console.log(`🚀 ArenaX Server running on port ${PORT}`);
-  console.log(`⚡ ZapUPI API Base: ${ZAPUPI_API_BASE}`);
-  console.log(`💳 PayPal Mode: ${PAYPAL_API_BASE.includes("sandbox") ? "SANDBOX" : "LIVE"}`);
+  console.log(`🚀 ArenaX Payment Gateway running on port ${PORT}`);
+  console.log(`💳 Merchant UPI: ${MERCHANT_UPI}`);
 });
